@@ -1,0 +1,9 @@
+name: acp
+version: 0.1.0
+description: ACP governance — audit and veto every tool call via the Agentic Control Plane.
+author: GatewayStack
+homepage: https://agenticcontrolplane.com
+provides:
+  hooks:
+    - pre_tool_call
+    - post_tool_call
