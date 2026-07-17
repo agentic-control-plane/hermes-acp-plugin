@@ -9,6 +9,8 @@ Routes every tool call through the [Agentic Control Plane](https://agenticcontro
 
 Companion to the [Claude Code ACP plugin](https://github.com/davidcrowe/claude-code-acp-plugin). Same backend contract, same dashboard, same policies — just wired into Hermes's Python plugin system instead of Claude Code's shell hooks.
 
+Full install guide with dashboard walkthrough: [agenticcontrolplane.com/integrations/hermes](https://agenticcontrolplane.com/integrations/hermes)
+
 ## Install
 
 ```bash
