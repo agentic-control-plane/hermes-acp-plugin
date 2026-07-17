@@ -11,8 +11,10 @@ Behavior:
   - Reads bearer token from ACP_BEARER_TOKEN or ~/.acp/credentials.
   - Sends X-GS-Client: hermes-plugin/<version> for per-client policy routing.
   - Hermes post_tool_call is observational (cannot block); we only log there.
-  - Hermes has no "ask" semantic, so an ACP `ask` decision is rendered as a
-    block with an approval-required message.
+  - An ACP `ask` decision escalates to Hermes's NATIVE approval gate
+    ({"action": "approve"}): the user answers [o]nce/[s]ession/[a]lways/[d]eny
+    inline, same as Hermes's own dangerous-shell tier. (0.1.0 wrongly claimed
+    Hermes had no ask semantic and hard-blocked with a dashboard detour.)
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 CLIENT_ID = f"hermes-plugin/{PLUGIN_VERSION}"
 
 DEFAULT_API_BASE = "https://api.agenticcontrolplane.com"
@@ -105,11 +107,14 @@ def _pre_tool_call(
     if decision == "deny":
         return _block(f"[ACP] Denied by policy: {reason}")
     if decision == "ask":
-        return _block(
-            f"[ACP] Approval required: {reason}. "
-            "Hermes has no inline approval surface; "
-            "approve in the ACP dashboard and retry."
-        )
+        # Escalate to Hermes's native human-approval gate — the same
+        # once/session/always/deny prompt its dangerous-shell tier uses.
+        # rule_key scopes an [a]lways answer to this tool under ACP's grain.
+        return {
+            "action": "approve",
+            "message": f"[ACP] Approval required: {reason}",
+            "rule_key": f"acp:{tool_name}",
+        }
     return None
 
 

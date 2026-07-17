@@ -80,7 +80,9 @@ def test_pre_deny_returns_block(tmp_path):
     assert "[ACP]" in result["message"]
 
 
-def test_pre_ask_renders_as_block(tmp_path):
+def test_pre_ask_escalates_to_native_approval_gate(tmp_path):
+    """ACP `ask` returns Hermes's approve directive — the native
+    once/session/always/deny prompt — not a hard block (0.1.1)."""
     _write_token(tmp_path)
     with patch(
         "urllib.request.urlopen",
@@ -88,9 +90,9 @@ def test_pre_ask_renders_as_block(tmp_path):
     ):
         result = _pre_tool_call("terminal", {"command": "deploy"}, task_id="t1")
     assert result is not None
-    assert result["action"] == "block"
-    assert "Approval required" in result["message"]
-    assert "dashboard" in result["message"].lower()
+    assert result["action"] == "approve"
+    assert "needs review" in result["message"]
+    assert result["rule_key"] == "acp:terminal"
 
 
 def test_pre_network_error_fails_open(tmp_path):

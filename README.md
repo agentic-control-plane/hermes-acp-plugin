@@ -51,7 +51,7 @@ The plugin registers two Hermes hooks:
 
 | Hook            | Behavior                                                      |
 |-----------------|---------------------------------------------------------------|
-| `pre_tool_call` | POSTs to `/govern/tool-use`. Server returns `allow` / `deny` / `ask`. `deny` and `ask` block the tool call with a system message; `allow` passes through. |
+| `pre_tool_call` | POSTs to `/govern/tool-use`. Server returns `allow` / `deny` / `ask`. `deny` blocks with a system message; `ask` escalates to Hermes's native approval prompt; `allow` passes through. |
 | `post_tool_call`| POSTs to `/govern/tool-output` for observation. Cannot block (Hermes limitation), but server-side audit, redaction logging, and DLP scanning all apply. |
 
 ### Fail-open
@@ -60,7 +60,7 @@ Network errors, timeouts (>4s), or malformed responses **fail open** — the too
 
 ### "Ask" semantic
 
-Hermes doesn't support inline approval prompts the way Claude Code does, so an ACP `ask` decision is rendered as a `block` with a message instructing the user to approve in the ACP dashboard and retry. If you want a richer approval UX in Hermes, this is the spot to extend.
+An ACP `ask` decision escalates to **Hermes's native approval gate** — the same inline `[o]nce / [s]ession / [a]lways / [d]eny` prompt Hermes uses for dangerous shell commands. An `[a]lways` answer is scoped to the tool via the plugin's `rule_key` (`acp:<tool>`), so a standing approval never widens beyond the tool the human actually reviewed. (Versions ≤0.1.0 wrongly claimed Hermes had no approval surface and hard-blocked with a dashboard detour — upgrade.)
 
 ### Client identity
 
