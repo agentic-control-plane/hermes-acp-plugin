@@ -6,6 +6,8 @@ Subcommands:
            protocol so the same workspace is reachable from any harness.
   status   Print whether ~/.acp/credentials is present and reachable.
   logout   Remove ~/.acp/credentials.
+  report   Local cost & quality X-ray from ~/.acp/hermes-local.db.
+           No account needed; --json for machine-readable output.
 
 The login flow:
   1. Open <dashboard>/plugin/authorize in browser.
@@ -164,6 +166,17 @@ def cmd_logout(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_report(args: argparse.Namespace) -> int:
+    from . import report
+
+    try:
+        print(report.build_report(days=args.days, as_json=args.json))
+        return 0
+    except Exception as exc:
+        sys.stderr.write(f"Report failed: {exc}\n")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hermes-acp", description="ACP CLI for Hermes Agent")
     parser.add_argument("--version", action="version", version=f"hermes-acp {PLUGIN_VERSION}")
@@ -178,6 +191,15 @@ def main(argv: list[str] | None = None) -> int:
 
     p_logout = sub.add_parser("logout", help="Remove ~/.acp/credentials")
     p_logout.set_defaults(func=cmd_logout)
+
+    p_report = sub.add_parser(
+        "report", help="Local cost & quality X-ray (no account needed)"
+    )
+    p_report.add_argument("--days", type=int, default=7, help="Window in days (default 7)")
+    p_report.add_argument(
+        "--json", action="store_true", help="Machine-readable output for self-optimizing agents"
+    )
+    p_report.set_defaults(func=cmd_report)
 
     args = parser.parse_args(argv)
     return int(args.func(args) or 0)
