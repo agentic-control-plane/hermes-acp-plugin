@@ -33,7 +33,7 @@ from typing import Any
 
 from . import local_store, pricing
 
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.2.1"
 CLIENT_ID = f"hermes-plugin/{PLUGIN_VERSION}"
 
 DEFAULT_API_BASE = "https://api.agenticcontrolplane.com"
