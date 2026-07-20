@@ -1,11 +1,15 @@
 # hermes-acp
 
-Cost & quality X-ray plus governance for [Hermes Agent](https://github.com/NousResearch/hermes-agent), via the [Agentic Control Plane](https://agenticcontrolplane.com).
+**Cost & quality X-ray plus deterministic governance for [Hermes Agent](https://github.com/NousResearch/hermes-agent)** — via the [Agentic Control Plane](https://agenticcontrolplane.com).
+
+[![PyPI](https://img.shields.io/pypi/v/hermes-acp)](https://pypi.org/project/hermes-acp/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![Python](https://img.shields.io/pypi/pyversions/hermes-acp)](https://pypi.org/project/hermes-acp/)
+
+<p align="center"><img src="docs/assets/report-hero.svg" alt="acp-hermes report — real output: 164 calls, 83% cache hit rate, context composition, per-tool costs" width="860"></p>
 
 Two planes, one plugin:
 
-- **Local metering (no account, nothing leaves your machine)** — every model call and tool call your Hermes agent makes is metered into a local SQLite DB. `hermes-acp report` shows spend by model, cache hit rate, what actually fills your context, tool error rates, and cost per task. `report --json` gives agents their own economics so they can self-optimize.
-- **Cloud governance (optional, free — `hermes-acp login`)** — every tool call is checked against server-side policy (deny / ask / allow with inline approvals), audited with tenant + session attribution, and visible on a team dashboard across all your machines.
+- **Local metering (no account, nothing leaves your machine)** — every model call and tool call your Hermes agent makes is metered into a local SQLite DB. `acp-hermes report` shows spend by model, cache hit rate, what actually fills your context, tool error rates, and cost per task. `report --json` gives agents their own economics so they can self-optimize.
+- **Cloud governance (optional, free — `acp-hermes login`)** — every tool call is checked against server-side policy (deny / ask / allow with inline approvals), audited with tenant + session attribution, and visible on a team dashboard across all your machines.
 
 Companion to the [Claude Code ACP plugin](https://github.com/agentic-control-plane/claude-code-acp-plugin). Same backend contract, same dashboard, same policies — wired into Hermes's Python plugin system instead of Claude Code's shell hooks.
 
@@ -21,33 +25,36 @@ hermes plugins enable acp
 That's it — local metering is on. After your next Hermes session:
 
 ```bash
-hermes-acp report
+acp-hermes report
 ```
 
 ```
 ACP local report — last 7 days (this machine, ~/.acp/hermes-local.db)
 
 MODEL SPEND
-  model                    calls   in-tok  out-tok  cache  est cost
-  Hermes-4.3-405B            128     224K      58K    34%     $2.41
-  ...
+  model                    calls   in-tok  out-tok  cache
+  gemini-pro-latest          164     827K     5.2K    83%
 
-CACHE  hit rate 34% (162K of 477K prompt tokens read from cache)
-  Low. A stable system prompt and append-only context (no mid-loop edits)
-  are the two biggest levers — cached reads bill at ~10% of full rate.
+CACHE  hit rate 83% (4.1M of 5.0M prompt tokens read from cache)
 
 CONTEXT COMPOSITION (share of prompt chars, all turns)
-  tool results 70% · system 21% · assistant 6% · user 3%
+  tool results 96% · system 0% · assistant 1% · user 3%
+  Tool results dominate your context — truncating or summarizing large
+  tool outputs is usually the cheapest big win.
 
-TOOLS (top by calls)                      TASKS  34 tasks · median $0.09 · p90 $0.41
+TOOLS (top by calls)
+  tool             calls  errors  avg ms   output
+  terminal           160       0    1201    492KB
 ```
+
+(That's real output from the autonomous agent that runs our own ops backlog — [governed by the same plugin](https://agenticcontrolplane.com/blog/setup-hermes-autonomous-agent-safely).)
 
 Costs come from Hermes's own pricing engine (same numbers Hermes shows you), including OpenRouter and Bedrock routes. Unknown routes are reported as unpriced, never guessed.
 
 To add policies, approvals, and the cross-machine dashboard:
 
 ```bash
-hermes-acp login
+acp-hermes login
 ```
 
 `login` opens the dashboard, exchanges your one-time auth token for a workspace API key, and writes it to `~/.acp/credentials`.
@@ -74,12 +81,12 @@ export ACP_LOCAL_DB=/path/to.db    # move the DB (default ~/.acp/hermes-local.db
 ## CLI
 
 ```bash
-hermes-acp report            # local cost & quality X-ray (no account needed)
-hermes-acp report --days 30  # wider window
-hermes-acp report --json     # machine-readable — feed it back to your agent
-hermes-acp login             # browser auth + workspace provisioning (cloud plane)
-hermes-acp status            # check creds + gateway reachability
-hermes-acp logout            # remove ~/.acp/credentials
+acp-hermes report            # local cost & quality X-ray (no account needed)
+acp-hermes report --days 30  # wider window
+acp-hermes report --json     # machine-readable — feed it back to your agent
+acp-hermes login             # browser auth + workspace provisioning (cloud plane)
+acp-hermes status            # check creds + gateway reachability
+acp-hermes logout            # remove ~/.acp/credentials
 ```
 
 Optional — point at a non-default backend:
@@ -115,7 +122,9 @@ Sends `X-GS-Client: hermes-plugin/<version>` so the dashboard, policy router, an
 
 ## Troubleshooting
 
-**`hermes-acp report` says no metered activity.** The metering hooks only run inside Hermes — confirm the plugin is enabled (`hermes plugins list`, then `hermes plugins enable acp`) and run a session. Also check `ACP_LOCAL_METERING` isn't set to `off`.
+**`hermes-acp` opens an editor/ACP mode instead of this CLI.** Hermes itself ships a `hermes-acp` binary (ACP there = Agent Client Protocol, its editor integration) — install order decides which one owns the name. This package installs **`acp-hermes`** as the unambiguous primary command (0.2.1+); use that. `python -m acp_hermes.cli` also always works.
+
+**`acp-hermes report` says no metered activity.** The metering hooks only run inside Hermes — confirm the plugin is enabled (`hermes plugins list`, then `hermes plugins enable acp`) and run a session. Also check `ACP_LOCAL_METERING` isn't set to `off`.
 
 **Costs show n/a.** Pricing comes from Hermes's engine in-process; routes it can't price (unusual proxies, self-hosted endpoints) are honestly unpriced. Token counts are still exact.
 

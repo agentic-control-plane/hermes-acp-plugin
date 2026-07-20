@@ -178,7 +178,7 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="hermes-acp", description="ACP CLI for Hermes Agent")
+    parser = argparse.ArgumentParser(prog="acp-hermes", description="ACP CLI for Hermes Agent")
     parser.add_argument("--version", action="version", version=f"hermes-acp {PLUGIN_VERSION}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
