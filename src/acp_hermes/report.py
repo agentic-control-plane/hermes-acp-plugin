@@ -61,13 +61,15 @@ def gather(days: int = 7) -> dict[str, Any]:
                 reasoning_tokens=r[6],
                 cost_usd=r[7],
                 unpriced_calls=r[8],
+                fallback_calls=r[9],
             )
             for r in conn.execute(
                 """
                 SELECT model, COUNT(*), SUM(input_tokens), SUM(output_tokens),
                        SUM(cache_read_tokens), SUM(cache_write_tokens),
                        SUM(reasoning_tokens), SUM(cost_usd),
-                       SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
+                       SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN cost_status = 'estimated-fallback' THEN 1 ELSE 0 END)
                 FROM model_calls WHERE ts >= ? GROUP BY model
                 ORDER BY SUM(cost_usd) DESC, COUNT(*) DESC
                 """,
@@ -157,6 +159,7 @@ def gather(days: int = 7) -> dict[str, Any]:
             "cache_read_tokens": cache_read,
             "cost_usd": sum(m["cost_usd"] or 0 for m in models),
             "unpriced_calls": sum(m["unpriced_calls"] for m in models),
+            "fallback_calls": sum(m.get("fallback_calls", 0) for m in models),
             "cache_hit_rate": (cache_read / prompt_total) if prompt_total else None,
             "sessions": sessions,
         },
@@ -211,6 +214,9 @@ def render(data: dict[str, Any]) -> str:
         )
         if t["unpriced_calls"]:
             out(f"  ({t['unpriced_calls']} calls have no price — route unknown to Hermes pricing)")
+        if t.get("fallback_calls"):
+            from .pricing import _FALLBACK_UPDATED
+            out(f"  (~{t['fallback_calls']} calls priced from the bundled fallback table, as of {_FALLBACK_UPDATED} — approximate; pip install -U hermes-acp refreshes)")
         out("")
 
         hit = t["cache_hit_rate"]

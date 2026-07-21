@@ -65,6 +65,7 @@ def estimate_cost_usd(
 # read_mult × input (0.1 typical; Gemini implicit ~0.25), writes at
 # 1.25 × input. Values mirror the gateway's MODEL_PRICING — update both
 # together. Longest-prefix match so dated/aliased ids resolve.
+_FALLBACK_UPDATED = "2026-07-21"  # bump when the table is refreshed
 _FALLBACK_PER_1M: dict[str, tuple[float, float, float]] = {
     # model-prefix: (input, output, cache_read_mult)
     "gemini-flash-lite": (0.10, 0.40, 0.25),
