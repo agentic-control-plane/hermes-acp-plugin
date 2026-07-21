@@ -177,6 +177,120 @@ def cmd_report(args: argparse.Namespace) -> int:
         return 1
 
 
+
+
+# ── proxy-setup ──────────────────────────────────────────────────────
+
+def cmd_proxy_setup(args: argparse.Namespace) -> int:
+    """Route Hermes's model calls through the ACP proxy (#1).
+
+    Registers a named `acp` provider (OpenAI-compatible endpoint) in
+    ~/.hermes/config.yaml pointing at the proxy, keeps the user's current
+    model, and puts the ACP key in ~/.hermes/.env as ACP_BEARER_TOKEN.
+    The proxy routes any model id (gpt-*/claude-*/gemini-*) to the real
+    provider, so this is provider-agnostic by design. Deterministic file
+    edits only; --print shows the plan, --undo restores the pre-setup
+    config, --verify makes one tiny completion through the proxy.
+    """
+    try:
+        import yaml  # hermes itself is YAML-configured, so this is present
+    except ImportError:
+        print("PyYAML not found — run this inside the environment Hermes is installed in.")
+        return 1
+
+    hermes_dir = Path.home() / ".hermes"
+    cfg_path = hermes_dir / "config.yaml"
+    backup_path = hermes_dir / "config.yaml.acp-backup"
+    env_path = hermes_dir / ".env"
+
+    if args.undo:
+        if backup_path.exists():
+            cfg_path.write_text(backup_path.read_text(encoding="utf-8"), encoding="utf-8")
+            backup_path.unlink()
+            print(f"Restored {cfg_path} from backup. (ACP_BEARER_TOKEN left in {env_path}; remove manually if unwanted.)")
+            return 0
+        print("No backup found — nothing to undo.")
+        return 1
+
+    cred_path = Path.home() / ".acp" / "credentials"
+    if not cred_path.exists():
+        print("No ACP credentials. Run `acp-hermes login` first (cloud account is what prices your calls).")
+        return 1
+    acp_key = cred_path.read_text(encoding="utf-8").strip()
+
+    cfg = {}
+    if cfg_path.exists():
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+
+    model_block = cfg.get("model") or {}
+    model_id = args.model or (model_block.get("default") if isinstance(model_block, dict) else None)
+    if not model_id:
+        print("Couldn't determine your current model from ~/.hermes/config.yaml.")
+        print("Re-run with:  acp-hermes proxy-setup --model <model-id>   (e.g. gemini-flash-latest)")
+        return 1
+
+    base = _api_base() + "/v1"
+    providers = cfg.get("providers") or {}
+    providers["acp"] = {
+        "base_url": base,
+        "key_env": "ACP_BEARER_TOKEN",
+        "type": "openai",
+        "default_model": model_id,
+    }
+    new_cfg = dict(cfg)
+    new_cfg["providers"] = providers
+    new_cfg["model"] = {**(model_block if isinstance(model_block, dict) else {}), "default": model_id, "provider": "acp"}
+
+    if args.print_only:
+        print("Would write to ~/.hermes/config.yaml:")
+        print(yaml.safe_dump({"model": new_cfg["model"], "providers": {"acp": providers["acp"]}}, sort_keys=False))
+        print(f"Would ensure ACP_BEARER_TOKEN is set in {env_path}")
+        return 0
+
+    if not backup_path.exists() and cfg_path.exists():
+        backup_path.write_text(cfg_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(yaml.safe_dump(new_cfg, sort_keys=False), encoding="utf-8")
+
+    env_text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    if "ACP_BEARER_TOKEN=" not in env_text:
+        with open(env_path, "a", encoding="utf-8") as f:
+            if env_text and not env_text.endswith("\n"):
+                f.write("\n")
+            f.write(f"ACP_BEARER_TOKEN={acp_key}\n")
+        os.chmod(env_path, 0o600)
+
+    print(f"✓ Hermes now routes model calls through the ACP proxy ({base})")
+    print(f"  provider: acp · model: {model_id} · key: ACP_BEARER_TOKEN in {env_path}")
+    print(f"  Undo any time: acp-hermes proxy-setup --undo")
+
+    if args.verify:
+        import json as _json
+        import urllib.request
+        req = urllib.request.Request(
+            base + "/chat/completions",
+            data=_json.dumps({"model": model_id, "messages": [{"role": "user", "content": "say ok"}], "max_tokens": 5}).encode(),
+            headers={"Authorization": f"Bearer {acp_key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                _json.loads(resp.read())
+                print("✓ Verified: a governed, metered completion just went through the proxy.")
+                print("  See it in the console: https://cloud.agenticcontrolplane.com")
+        except Exception as e:  # noqa: BLE001 — report, never crash setup
+            body = getattr(e, "read", lambda: b"")()
+            print(f"✗ Verify call failed: {e}")
+            if b"Unknown model" in body:
+                print("  The proxy doesn't route this model id — check the model name.")
+            elif getattr(e, "code", None) == 401:
+                print("  Auth failed — re-run `acp-hermes login`.")
+            else:
+                print("  Likely missing provider key for this model's route — add it in the console: Settings → Model keys.")
+            return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="acp-hermes", description="ACP CLI for Hermes Agent")
     parser.add_argument("--version", action="version", version=f"hermes-acp {PLUGIN_VERSION}")
@@ -200,6 +314,16 @@ def main(argv: list[str] | None = None) -> int:
         "--json", action="store_true", help="Machine-readable output for self-optimizing agents"
     )
     p_report.set_defaults(func=cmd_report)
+
+    p_proxy = sub.add_parser(
+        "proxy-setup",
+        help="Route Hermes's model calls through the ACP proxy (cloud cost X-ray)",
+    )
+    p_proxy.add_argument("--model", help="Model id to keep (default: current config.yaml model)")
+    p_proxy.add_argument("--print", dest="print_only", action="store_true", help="Show the plan without writing")
+    p_proxy.add_argument("--undo", action="store_true", help="Restore the pre-setup config.yaml")
+    p_proxy.add_argument("--verify", action="store_true", help="Send one tiny completion through the proxy after setup")
+    p_proxy.set_defaults(func=cmd_proxy_setup)
 
     args = parser.parse_args(argv)
     return int(args.func(args) or 0)
