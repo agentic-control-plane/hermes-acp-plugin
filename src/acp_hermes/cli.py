@@ -177,6 +177,89 @@ def cmd_report(args: argparse.Namespace) -> int:
         return 1
 
 
+# ── coverage ─────────────────────────────────────────────────────────
+
+def _get_json(url: str, token: str) -> dict[str, Any]:
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-GS-Client": f"hermes-plugin/{PLUGIN_VERSION}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+        return json.loads(resp.read() or b"{}")
+
+
+def _slug_from_key(token: str) -> str | None:
+    # gsk_{slug}_{random} — same parse the gateway uses (parts[1]).
+    parts = token.split("_")
+    if not token.startswith("gsk_") or len(parts) < 3:
+        return None
+    return parts[1]
+
+
+def cmd_coverage(args: argparse.Namespace) -> int:
+    """Two-plane coverage doctor: which plane(s) does each client's traffic
+    have, and the exact missing step. Prints the workspace's
+    /admin/coverage report — the same contract the console Coverage card
+    renders, so terminal and dashboard never disagree."""
+    creds = _credentials_path()
+    if not creds.exists():
+        print("No ACP credentials. Run `acp-hermes login` first.")
+        return 1
+    token = creds.read_text(encoding="utf-8").strip()
+    slug = _slug_from_key(token)
+    if not slug:
+        print("Credential is not a gsk_ workspace key — can't derive the workspace. Re-run `acp-hermes login`.")
+        return 1
+
+    try:
+        data = _get_json(f"{_api_base()}/{slug}/admin/coverage", token)
+    except urllib.error.HTTPError as exc:
+        print(f"Coverage check failed: HTTP {exc.code} {exc.reason}")
+        return 1
+    except (urllib.error.URLError, TimeoutError) as exc:
+        print(f"Coverage check failed: {exc}")
+        return 1
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+
+    clients = data.get("clients") or []
+    ws = data.get("workspace") or {}
+    mark = lambda b: "✓" if b else "✗"  # noqa: E731
+    print(f"Coverage — workspace '{slug}', last {data.get('windowDays', 30)} days")
+    if not clients:
+        print("  No governed traffic yet. Both planes come up with one setup step per stack:")
+        print(f"  {data.get('setupUrl', 'https://agenticcontrolplane.com/docs/setup')}")
+        return 0
+    for c in clients:
+        i, p = c.get("interception", {}), c.get("proxy", {})
+        print(
+            f"  {c.get('client', '?'):24} {c.get('family', ''):14} "
+            f"interception {mark(i.get('active'))} ({i.get('calls', 0)} calls)   "
+            f"proxy {mark(p.get('active'))} ({p.get('calls', 0)} calls)"
+        )
+        fix = c.get("fix")
+        if fix:
+            print(f"    → {fix.get('run')}")
+            if fix.get("docs"):
+                print(f"      docs: {fix['docs']}")
+        elif c.get("note"):
+            print(f"    note: {c['note']}")
+    print(f"  Workspace: interception {mark(ws.get('interception'))} · proxy {mark(ws.get('proxy'))}")
+    full = all(
+        c.get("interception", {}).get("active") and c.get("proxy", {}).get("active")
+        for c in clients
+    )
+    if not full:
+        print(f"  Full guide: {data.get('setupUrl', 'https://agenticcontrolplane.com/docs/setup')}")
+    return 0
+
+
 
 
 # ── proxy-setup ──────────────────────────────────────────────────────
@@ -324,6 +407,15 @@ def main(argv: list[str] | None = None) -> int:
     p_proxy.add_argument("--undo", action="store_true", help="Restore the pre-setup config.yaml")
     p_proxy.add_argument("--verify", action="store_true", help="Send one tiny completion through the proxy after setup")
     p_proxy.set_defaults(func=cmd_proxy_setup)
+
+    p_cov = sub.add_parser(
+        "coverage",
+        help="Two-plane coverage doctor: interception ✓/✗ · proxy ✓/✗ per client, with the exact missing step",
+    )
+    p_cov.add_argument(
+        "--json", action="store_true", help="Machine-readable output (the raw /admin/coverage contract)"
+    )
+    p_cov.set_defaults(func=cmd_coverage)
 
     args = parser.parse_args(argv)
     return int(args.func(args) or 0)
