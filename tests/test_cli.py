@@ -254,3 +254,67 @@ def test_coverage_empty_workspace_points_at_setup(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "docs/setup" in out
+
+
+# ── device login ─────────────────────────────────────────────────────
+
+
+def _device_args(force: bool = False) -> argparse.Namespace:
+    return argparse.Namespace(cmd="login", force=force, device=True, func=cli.cmd_login)
+
+
+def test_device_login_polls_until_approved(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    grant = json.dumps({
+        "device_code": "d" * 64, "user_code": "ACDE-FGHJ",
+        "verification_uri_complete": "https://cloud.example/device?code=ACDE-FGHJ",
+        "expires_in": 900, "interval": 5,
+    }).encode()
+    token_ok = json.dumps({"apiKey": "gsk_ws_key", "workspace": "ws", "isNew": True}).encode()
+    calls = {"n": 0}
+
+    def _urlopen(req, timeout):  # noqa: ARG001
+        if req.full_url.endswith("/device/code"):
+            return FakeResponse(grant)
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "Bad Request", None,
+                io.BytesIO(json.dumps({"error": "authorization_pending"}).encode()),
+            )
+        return FakeResponse(token_ok)
+
+    with patch("urllib.request.urlopen", _urlopen):
+        rc = cli.cmd_login(_device_args())
+    assert rc == 0
+    assert (tmp_path / ".acp" / "credentials").read_text().strip() == "gsk_ws_key"
+    assert calls["n"] == 3
+
+
+def test_device_login_expired_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    grant = json.dumps({
+        "device_code": "d" * 64, "user_code": "ACDE-FGHJ",
+        "verification_uri": "https://cloud.example/device", "expires_in": 900, "interval": 5,
+    }).encode()
+
+    def _urlopen(req, timeout):  # noqa: ARG001
+        if req.full_url.endswith("/device/code"):
+            return FakeResponse(grant)
+        raise urllib.error.HTTPError(
+            req.full_url, 400, "Bad Request", None,
+            io.BytesIO(json.dumps({"error": "expired_token"}).encode()),
+        )
+
+    with patch("urllib.request.urlopen", _urlopen):
+        rc = cli.cmd_login(_device_args())
+    assert rc == 1
+    assert not (tmp_path / ".acp" / "credentials").exists()
+
+
+def test_device_login_gateway_unreachable(tmp_path):
+    def _down(req, timeout):  # noqa: ARG001
+        raise urllib.error.URLError("down")
+    with patch("urllib.request.urlopen", _down):
+        rc = cli.cmd_login(_device_args())
+    assert rc == 1

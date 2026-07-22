@@ -24,6 +24,7 @@ import json
 import os
 import stat
 import sys
+import time
 import urllib.error
 import urllib.request
 import webbrowser
@@ -97,6 +98,9 @@ def cmd_login(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if getattr(args, "device", False):
+        return _login_device(creds)
+
     auth_url = f"{_dashboard_base()}/plugin/authorize"
     sys.stderr.write(f"Opening browser: {auth_url}\n")
     try:
@@ -139,6 +143,85 @@ def cmd_login(args: argparse.Namespace) -> int:
 
     sys.stderr.write(f"\nDashboard: {_dashboard_base()}/logs\n")
     return 0
+
+
+def _post_json_noauth(url: str, body: dict[str, Any]) -> dict[str, Any]:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-GS-Client": f"hermes-plugin/{PLUGIN_VERSION}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+        return json.loads(resp.read() or b"{}")
+
+
+def _login_device(creds: Path) -> int:
+    """Device-code login for headless boxes (#303): no browser needed HERE —
+    a short code is approved from any browser, and the key lands directly in
+    this machine's credentials file. The device_code never leaves this
+    process; the human-facing user_code can't redeem anything by itself."""
+    try:
+        grant = _post_json_noauth(f"{_api_base()}/device/code", {"client": "acp-hermes"})
+    except (urllib.error.URLError, TimeoutError) as exc:
+        sys.stderr.write(f"Could not reach the gateway: {exc}\n")
+        return 1
+    user_code = grant.get("user_code")
+    device_code = grant.get("device_code")
+    verify_url = grant.get("verification_uri_complete") or grant.get("verification_uri")
+    interval = max(2, int(grant.get("interval", 5)))
+    expires_in = int(grant.get("expires_in", 900))
+    if not user_code or not device_code or not verify_url:
+        sys.stderr.write(f"Malformed device grant: {grant!r}\n")
+        return 1
+
+    sys.stderr.write("\n  On any browser (this machine or your phone), open:\n")
+    sys.stderr.write(f"    {verify_url}\n")
+    sys.stderr.write(f"  and approve code:  {user_code}\n\n")
+    sys.stderr.write("  Waiting for approval")
+    sys.stderr.flush()
+
+    deadline = time.time() + expires_in
+    while time.time() < deadline:
+        time.sleep(interval)
+        try:
+            result = _post_json_noauth(f"{_api_base()}/device/token", {"device_code": device_code})
+        except urllib.error.HTTPError as exc:
+            try:
+                err = json.loads(exc.read() or b"{}").get("error", "")
+            except Exception:
+                err = ""
+            if err == "authorization_pending":
+                sys.stderr.write(".")
+                sys.stderr.flush()
+                continue
+            if err == "slow_down":
+                interval += 2
+                continue
+            sys.stderr.write(f"\nDevice login failed: {err or exc}\n")
+            return 1
+        except (urllib.error.URLError, TimeoutError):
+            sys.stderr.write("x")  # transient — keep polling until expiry
+            sys.stderr.flush()
+            continue
+        api_key = result.get("apiKey")
+        workspace = result.get("workspace")
+        if not api_key or not workspace:
+            sys.stderr.write(f"\nMalformed token response: {result!r}\n")
+            return 1
+        path = _write_credentials(api_key)
+        verb = "Created" if result.get("isNew") else "Connected to"
+        sys.stderr.write(f"\n{verb} workspace: {workspace}\n")
+        sys.stderr.write(f"Credentials written to {path}\n")
+        sys.stderr.write(f"\nDashboard: {_dashboard_base()}/logs\n")
+        return 0
+
+    sys.stderr.write("\nCode expired before approval. Re-run `acp-hermes login --device`.\n")
+    return 1
 
 
 def cmd_status(_: argparse.Namespace) -> int:
@@ -381,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_login = sub.add_parser("login", help="Authenticate and write ~/.acp/credentials")
     p_login.add_argument("--force", action="store_true", help="Overwrite existing credentials")
+    p_login.add_argument("--device", action="store_true", help="Device-code flow for headless machines: approve a short code from any browser; no browser needed here")
     p_login.set_defaults(func=cmd_login)
 
     p_status = sub.add_parser("status", help="Show credential and gateway status")
