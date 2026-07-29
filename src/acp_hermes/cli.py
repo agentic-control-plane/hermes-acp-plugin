@@ -90,6 +90,53 @@ def _prompt(message: str) -> str:
     return input().strip()
 
 
+def _enable_hermes_plugin() -> str:
+    """Best-effort `hermes plugins enable acp` after a successful login.
+
+    Login writing credentials is not enough: until the plugin is enabled
+    inside Hermes, sessions run and send us nothing, silently. install.sh
+    already auto-enables — but it's bash, so Windows/pip-path users never
+    get it (the 2026-07-29 Kreation signup connected successfully and then
+    made zero calls for exactly this reason). Cross-platform here, in the
+    step every user runs.
+
+    Returns "enabled", "no-hermes" (CLI not on PATH), or "failed".
+    Never raises — a broken enable must not fail an otherwise good login.
+    """
+    import shutil
+    import subprocess
+
+    hermes = shutil.which("hermes")
+    if not hermes:
+        return "no-hermes"
+    try:
+        proc = subprocess.run(
+            [hermes, "plugins", "enable", "acp"],
+            capture_output=True,
+            timeout=30,
+        )
+        return "enabled" if proc.returncode == 0 else "failed"
+    except (OSError, subprocess.SubprocessError):
+        return "failed"
+
+
+def _report_plugin_enable() -> None:
+    """Run the auto-enable and tell the user exactly where they stand."""
+    state = _enable_hermes_plugin()
+    if state == "enabled":
+        sys.stderr.write("Hermes plugin enabled — your next session is governed.\n")
+    elif state == "no-hermes":
+        sys.stderr.write(
+            "`hermes` not found on PATH — once Hermes is installed, run:\n"
+            "  hermes plugins enable acp\n"
+        )
+    else:
+        sys.stderr.write(
+            "Could not enable the plugin automatically. Run:\n"
+            "  hermes plugins enable acp\n"
+        )
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     creds = _credentials_path()
     if creds.exists() and not args.force:
@@ -134,6 +181,7 @@ def cmd_login(args: argparse.Namespace) -> int:
     verb = "Created" if is_new else "Connected to"
     sys.stderr.write(f"{verb} workspace: {workspace}\n")
     sys.stderr.write(f"Credentials written to {path}\n")
+    _report_plugin_enable()
 
     try:
         _get(f"{_api_base()}/govern/health")
@@ -217,6 +265,7 @@ def _login_device(creds: Path) -> int:
         verb = "Created" if result.get("isNew") else "Connected to"
         sys.stderr.write(f"\n{verb} workspace: {workspace}\n")
         sys.stderr.write(f"Credentials written to {path}\n")
+        _report_plugin_enable()
         sys.stderr.write(f"\nDashboard: {_dashboard_base()}/logs\n")
         return 0
 
@@ -230,6 +279,21 @@ def cmd_status(_: argparse.Namespace) -> int:
         sys.stderr.write("Not configured. Run `hermes-acp login`.\n")
         return 1
     sys.stderr.write(f"Credentials present at {creds}\n")
+    import shutil
+    import subprocess
+    hermes = shutil.which("hermes")
+    if hermes:
+        try:
+            proc = subprocess.run([hermes, "plugins", "list"], capture_output=True, timeout=30, text=True)
+            listed = (proc.stdout or "") + (proc.stderr or "")
+            if proc.returncode == 0 and "acp" in listed:
+                sys.stderr.write("Hermes plugin: enabled.\n")
+            else:
+                sys.stderr.write("Hermes plugin NOT enabled — run: hermes plugins enable acp\n")
+        except (OSError, subprocess.SubprocessError):
+            sys.stderr.write("Could not query Hermes plugin state (hermes plugins list failed).\n")
+    else:
+        sys.stderr.write("`hermes` not on PATH — plugin state unknown.\n")
     try:
         status = _get(f"{_api_base()}/govern/health")
         sys.stderr.write(f"Gateway reachable (HTTP {status}).\n")

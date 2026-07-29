@@ -43,7 +43,12 @@ def _rows(table: str) -> list[tuple]:
         conn.close()
 
 
-def test_post_api_request_records_model_call():
+def test_post_api_request_records_model_call(monkeypatch):
+    # Hermetic: block Hermes's own estimator so this passes identically on
+    # machines with and without hermes-agent installed (it was green only on
+    # hermes-less machines before — the venv gaining hermes-agent broke it).
+    monkeypatch.setitem(sys.modules, "agent", None)
+    monkeypatch.setitem(sys.modules, "agent.usage_pricing", None)
     acp_hermes._post_api_request(
         model="claude-sonnet-5",
         provider="anthropic",
@@ -62,9 +67,12 @@ def test_post_api_request_records_model_call():
     assert data["input_tokens"] == 1000
     assert data["cache_read_tokens"] == 4000
     assert data["api_duration_ms"] == 1250
-    # Outside Hermes, pricing is honestly unknown — never a stale guess.
-    assert data["cost_usd"] is None
-    assert data["cost_status"] == "unknown"
+    # Outside Hermes the longest-prefix fallback table prices known models
+    # (0.2.3): claude-sonnet @ $3/$15, cache-read 0.10x, cache-write 1.25x.
+    # An UNKNOWN model staying (None, "unknown") is asserted separately in
+    # the pricing tests — this is the known-model path.
+    assert data["cost_usd"] == pytest.approx(0.009075)
+    assert data["cost_status"] == "estimated-fallback"
 
 
 def _describe(table: str) -> list[tuple]:

@@ -318,3 +318,50 @@ def test_device_login_gateway_unreachable(tmp_path):
     with patch("urllib.request.urlopen", _down):
         rc = cli.cmd_login(_device_args())
     assert rc == 1
+
+
+# ── login auto-enable (#Kreation gap): login must finish the job ─────────────
+# install.sh auto-enables the plugin but is bash-only; Windows/pip-path users
+# logged in successfully and then hermes sent nothing, silently. Login now
+# attempts `hermes plugins enable acp` itself and always says where you stand.
+
+def test_enable_hermes_plugin_no_hermes_on_path():
+    with patch("shutil.which", return_value=None):
+        assert cli._enable_hermes_plugin() == "no-hermes"
+
+
+def test_enable_hermes_plugin_success():
+    fake = type("P", (), {"returncode": 0})()
+    with patch("shutil.which", return_value="/usr/bin/hermes"), \
+         patch("subprocess.run", return_value=fake) as run:
+        assert cli._enable_hermes_plugin() == "enabled"
+    assert run.call_args[0][0] == ["/usr/bin/hermes", "plugins", "enable", "acp"]
+
+
+def test_enable_hermes_plugin_failure_is_contained():
+    with patch("shutil.which", return_value="/usr/bin/hermes"), \
+         patch("subprocess.run", side_effect=OSError("boom")):
+        assert cli._enable_hermes_plugin() == "failed"
+
+
+def test_report_plugin_enable_prints_next_command_when_not_enabled(capsys):
+    with patch.object(cli, "_enable_hermes_plugin", return_value="failed"):
+        cli._report_plugin_enable()
+    assert "hermes plugins enable acp" in capsys.readouterr().err
+
+
+def test_browser_login_runs_auto_enable(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    provision = json.dumps({"apiKey": "gsk_test_abc", "workspace": "w1", "isNew": True}).encode()
+
+    def _urlopen(req, timeout):  # noqa: ARG001
+        return FakeResponse(provision)
+
+    args = argparse.Namespace(force=True, device=False)
+    with patch("urllib.request.urlopen", _urlopen), \
+         patch("webbrowser.open"), \
+         patch.object(cli, "_prompt", return_value="gsk_test_token"), \
+         patch.object(cli, "_report_plugin_enable") as enable:
+        rc = cli.cmd_login(args)
+    assert rc == 0
+    enable.assert_called_once()
