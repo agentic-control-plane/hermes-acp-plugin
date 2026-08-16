@@ -3,12 +3,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "hermes-acp"
-version = "0.2.4"
+name = "acp-hermes"
+version = "0.2.5"
 description = "ACP governance plugin for Hermes Agent — audit and veto every tool call via the Agentic Control Plane."
 readme = "README.md"
 license = { text = "MIT" }
-authors = [{ name = "GatewayStack" }]
+authors = [{ name = "Agentic Control Plane" }]
 requires-python = ">=3.10"
 dependencies = []
 
@@ -25,9 +25,12 @@ Issues = "https://github.com/agentic-control-plane/hermes-acp-plugin/issues"
 acp = "acp_hermes"
 
 [project.scripts]
-# acp-hermes is the primary, unambiguous name. hermes-acp is kept for
-# compatibility but Nous's hermes-agent ships its OWN bin of that name
-# (Agent Client Protocol editor mode) — install order decides who owns it.
+# acp-hermes is the primary, unambiguous name — and as of 0.2.5 the
+# distribution is named for it too, so package, module, and command finally
+# agree. hermes-acp stays as a compatibility alias for anyone who installed
+# the old name, but Nous's hermes-agent ships its OWN bin of that name
+# (Agent Client Protocol editor mode) — install order decides who owns it,
+# which is exactly why it is no longer the primary.
 acp-hermes = "acp_hermes.cli:main"
 hermes-acp = "acp_hermes.cli:main"
 

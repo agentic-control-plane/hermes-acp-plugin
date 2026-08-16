@@ -18,7 +18,7 @@ Full install guide with dashboard walkthrough: [agenticcontrolplane.com/integrat
 ## Install
 
 ```bash
-pip install hermes-acp
+pip install acp-hermes
 hermes plugins enable acp
 ```
 
