@@ -1,8 +1,8 @@
-# hermes-acp
+# acp-hermes
 
 **Cost & quality X-ray plus deterministic governance for [Hermes Agent](https://github.com/NousResearch/hermes-agent)** — via the [Agentic Control Plane](https://agenticcontrolplane.com).
 
-[![PyPI](https://img.shields.io/pypi/v/hermes-acp)](https://pypi.org/project/hermes-acp/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![Python](https://img.shields.io/pypi/pyversions/hermes-acp)](https://pypi.org/project/hermes-acp/)
+[![PyPI](https://img.shields.io/pypi/v/acp-hermes)](https://pypi.org/project/acp-hermes/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![Python](https://img.shields.io/pypi/pyversions/acp-hermes)](https://pypi.org/project/acp-hermes/)
 
 <p align="center"><img src="docs/assets/report-hero.svg" alt="acp-hermes report — real output: 164 calls, 83% cache hit rate, context composition, per-tool costs" width="860"></p>
 
