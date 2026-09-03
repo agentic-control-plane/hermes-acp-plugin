@@ -59,6 +59,12 @@ acp-hermes login
 
 `login` opens the dashboard, exchanges your one-time auth token for a workspace API key, and writes it to `~/.acp/credentials`.
 
+On a headless box (SSH, devcontainer, a server with no browser), use the device flow instead — it prints a short code you approve from any browser, phone included, and the key lands on this machine:
+
+```bash
+acp-hermes login --device
+```
+
 ## Configure
 
 For non-interactive setups (CI, devcontainers), skip the `login` step and provide the key directly:
