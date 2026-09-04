@@ -229,8 +229,23 @@ def _login_device(creds: Path) -> int:
 
     sys.stderr.write("\n  On any browser (this machine or your phone), open:\n")
     sys.stderr.write(f"    {verify_url}\n")
-    sys.stderr.write(f"  and approve code:  {user_code}\n\n")
-    sys.stderr.write("  Waiting for approval")
+    sys.stderr.write(f"  and approve code:  {user_code}\n")
+    # Same courtesy as install.sh's device flow: if THIS box has a browser,
+    # open it with the code pre-filled. On a headless box webbrowser.open
+    # returns False (or raises) and the printed URL is the path — a real
+    # user issued a code on 2026-09-03 and never redeemed it, and a URL that
+    # only ever gets printed is the likeliest thing to have been missed.
+    opened = False
+    try:
+        opened = bool(webbrowser.open(verify_url))
+    except webbrowser.Error:
+        opened = False
+    if opened:
+        sys.stderr.write("  Opening your browser (code is pre-filled)…\n")
+    sys.stderr.write(
+        f"\n  Waiting for approval (code valid for {max(1, expires_in // 60)} min; "
+        "Ctrl+C is safe — re-run `acp-hermes login --device` any time)"
+    )
     sys.stderr.flush()
 
     deadline = time.time() + expires_in

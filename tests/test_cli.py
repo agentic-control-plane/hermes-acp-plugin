@@ -265,6 +265,8 @@ def _device_args(force: bool = False) -> argparse.Namespace:
 
 def test_device_login_polls_until_approved(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    opened = []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url) or True)
     grant = json.dumps({
         "device_code": "d" * 64, "user_code": "ACDE-FGHJ",
         "verification_uri_complete": "https://cloud.example/device?code=ACDE-FGHJ",
@@ -289,10 +291,17 @@ def test_device_login_polls_until_approved(tmp_path, monkeypatch):
     assert rc == 0
     assert (tmp_path / ".acp" / "credentials").read_text().strip() == "gsk_ws_key"
     assert calls["n"] == 3
+    # A box that HAS a browser gets it opened with the code pre-filled,
+    # exactly like install.sh's device flow — printing alone was missed.
+    assert opened == ["https://cloud.example/device?code=ACDE-FGHJ"]
 
 
 def test_device_login_expired_code(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    # Headless: webbrowser.open raising must not abort the flow.
+    def _no_browser(url):
+        raise cli.webbrowser.Error("no display")
+    monkeypatch.setattr(cli.webbrowser, "open", _no_browser)
     grant = json.dumps({
         "device_code": "d" * 64, "user_code": "ACDE-FGHJ",
         "verification_uri": "https://cloud.example/device", "expires_in": 900, "interval": 5,
