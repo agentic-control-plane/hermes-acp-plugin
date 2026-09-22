@@ -1,0 +1,4 @@
+home/
+venv/
+*.stderr
+requests.log
