@@ -132,6 +132,10 @@ Sends `X-GS-Client: hermes-plugin/<version>` so the dashboard, policy router, an
 
 **`acp-hermes report` says no metered activity.** The metering hooks only run inside Hermes — confirm the plugin is enabled (`hermes plugins list`, then `hermes plugins enable acp`) and run a session. Also check `ACP_LOCAL_METERING` isn't set to `off`.
 
+**Is the plugin actually enabled?** Hermes treats external plugins as opt-in: `pip install` alone makes it *discoverable*, but until `hermes plugins enable acp` runs, **no hooks are registered and sessions send ACP nothing** — silently. `acp-hermes login` runs the enable step for you; `acp-hermes doctor` reads Hermes's own plugin registry and tells you definitively (`hermes plugins list` can mislead: the bundled `copilot-acp-provider` row also contains "acp"). `acp-hermes doctor --canary` then pushes one `acp_doctor` call through Hermes's real pre-dispatch path and reports the verdict.
+
+**A call shows "ran ungoverned" in the console.** That call executed without a pre-call policy check. The row's detail says why: `gateway unreachable at PreToolUse: …` (network/timeout, we fail open) or `pre-hook-missing: …` (Hermes ran the tool without invoking `pre_tool_call` at all). The plugin keeps a per-call ledger and carries these as `pre_lapse` on the next PostToolUse, so the gap is recorded instead of logged as a clean pass.
+
 **Costs show n/a.** Pricing comes from Hermes's engine in-process; routes it can't price (unusual proxies, self-hosted endpoints) are honestly unpriced. Token counts are still exact.
 
 **No audit events appearing on the dashboard.** Check that `ACP_BEARER_TOKEN` is set in the shell that launched `hermes`, not just your `.zshrc` after the fact. Hermes inherits the env at process start.
