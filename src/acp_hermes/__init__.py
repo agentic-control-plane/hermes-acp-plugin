@@ -19,26 +19,131 @@ Local metering (works with ZERO credentials, nothing leaves the machine):
 
 Everything fails OPEN: an ACP outage, a full disk, or a locked SQLite file
 must never block a Hermes run.
+
+Pre-lapse ledger (0.3.0): a tool call that ran WITHOUT a pre-call policy
+check is a coverage gap ACP must be able to see. Two ways it happens:
+  - the gateway was unreachable at pre_tool_call (we fail open), or
+  - Hermes never invoked pre_tool_call for the call at all (seen in
+    production 2026-09-22: one PostToolUse, no PreToolUse, decision "pass").
+The pre hook records every call it handled; the post hook checks the
+ledger and carries any lapse to the gateway as `pre_lapse: [{at, tool,
+detail}]` on the next PostToolUse — the same wire contract the Claude Code
+plugin uses (#902) — so the console shows "ran ungoverned" instead of a
+clean pass. Both hooks also send `call_id` (#681) so the rows pair.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
+import hashlib
 import json
 import os
 import sys
+import threading
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 from . import local_store, pricing
 
-PLUGIN_VERSION = "0.2.4"
+
+# Only used when the package is imported from a source tree without dist
+# metadata (tests, `python -m` from a checkout). tests/test_cli.py pins it
+# to pyproject's version so a release bump can't leave it behind again.
+_FALLBACK_VERSION = "0.3.0"
+
+
+def _dist_version() -> str:
+    """Version from package metadata so the wire `X-GS-Client` can never
+    drift from what pip installed (issue #6: 0.2.4 on the wire, 0.2.6 dist)."""
+    try:
+        from importlib.metadata import version
+
+        return version("acp-hermes")
+    except Exception:
+        return _FALLBACK_VERSION
+
+
+PLUGIN_VERSION = _dist_version()
 CLIENT_ID = f"hermes-plugin/{PLUGIN_VERSION}"
 
 DEFAULT_API_BASE = "https://api.agenticcontrolplane.com"
 REQUEST_TIMEOUT_SECONDS = 4.0
 POST_HOOK_PAYLOAD_CEILING = 200 * 1024  # 200 KB, matches backend scan ceiling.
+
+# Pre-lapse ledger bounds. Gateway caps: 20 items, at<=40, tool<=120,
+# detail<=200 chars (hookGovernance.ts PRE_LAPSE_*); we stay inside them.
+PRE_LEDGER_MAX = 256
+PRE_LAPSE_MAX_ITEMS = 20
+_PRE_LAPSE_TOOL_MAX = 120
+_PRE_LAPSE_DETAIL_MAX = 200
+
+_ledger_lock = threading.Lock()
+# call key -> True once pre_tool_call handled that call (any outcome).
+_pre_ledger: "OrderedDict[str, bool]" = OrderedDict()
+# Lapses waiting to ride the next PostToolUse.
+_pending_lapses: list[dict[str, str]] = []
+
+
+def _call_key(tool_name: str, args: Any, tool_call_id: str) -> str:
+    """Stable identity for one tool call. Hermes passes tool_call_id to both
+    hooks (0.19 and main); fall back to tool + args digest when absent."""
+    if tool_call_id:
+        return f"id:{tool_call_id}"
+    try:
+        blob = json.dumps(args, sort_keys=True, default=str)
+    except Exception:
+        blob = str(args)
+    return f"{tool_name}:{hashlib.sha256(blob.encode('utf-8', 'replace')).hexdigest()[:16]}"
+
+
+def _note_pre(key: str) -> None:
+    with _ledger_lock:
+        _pre_ledger[key] = True
+        _pre_ledger.move_to_end(key)
+        while len(_pre_ledger) > PRE_LEDGER_MAX:
+            _pre_ledger.popitem(last=False)
+
+
+def _pop_pre(key: str) -> bool:
+    with _ledger_lock:
+        return _pre_ledger.pop(key, None) is not None
+
+
+def _note_lapse(tool_name: str, detail: str) -> None:
+    entry = {
+        "at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "tool": tool_name[:_PRE_LAPSE_TOOL_MAX] or "unknown",
+        "detail": " ".join(detail.split())[:_PRE_LAPSE_DETAIL_MAX],
+    }
+    with _ledger_lock:
+        if len(_pending_lapses) < PRE_LAPSE_MAX_ITEMS:
+            _pending_lapses.append(entry)
+
+
+def _drain_lapses() -> list[dict[str, str]]:
+    with _ledger_lock:
+        out = list(_pending_lapses)
+        _pending_lapses.clear()
+        return out
+
+
+def _requeue_lapses(entries: list[dict[str, str]]) -> None:
+    """The PostToolUse carrying them failed — keep them for the next one."""
+    if not entries:
+        return
+    with _ledger_lock:
+        room = PRE_LAPSE_MAX_ITEMS - len(_pending_lapses)
+        if room > 0:
+            _pending_lapses[:0] = entries[:room]
+
+
+def _reset_ledger_for_tests() -> None:
+    with _ledger_lock:
+        _pre_ledger.clear()
+        _pending_lapses.clear()
 
 
 def _api_base() -> str:
@@ -56,7 +161,11 @@ def _resolve_token() -> str | None:
         return None
 
 
-def _post_json(path: str, body: dict[str, Any], token: str) -> dict[str, Any] | None:
+def _post_json_detail(
+    path: str, body: dict[str, Any], token: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """POST and return (parsed_json, failure_detail). Exactly one is None.
+    The detail is what a pre-lapse report carries, so it names the cause."""
     url = f"{_api_base()}{path}"
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -73,14 +182,24 @@ def _post_json(path: str, body: dict[str, Any], token: str) -> dict[str, Any] | 
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
             raw = resp.read()
             if not raw:
-                return {}
+                return {}, None
             try:
-                return json.loads(raw)
+                return json.loads(raw), None
             except json.JSONDecodeError:
-                return None
+                return None, "unparseable gateway response"
+    except urllib.error.HTTPError as exc:
+        # 4xx/5xx: the gateway answered but did not decide (401 revoked key,
+        # 429, 5xx). Report it as what it is, not as "unreachable".
+        sys.stderr.write(f"[ACP] gateway returned HTTP {exc.code}; failing open\n")
+        return None, f"http {exc.code}"
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
         sys.stderr.write(f"[ACP] gateway unreachable ({exc}); failing open\n")
-        return None
+        reason = getattr(exc, "reason", None) or exc
+        return None, f"{type(exc).__name__}: {reason}"
+
+
+def _post_json(path: str, body: dict[str, Any], token: str) -> dict[str, Any] | None:
+    return _post_json_detail(path, body, token)[0]
 
 
 def _block(message: str) -> dict[str, str]:
@@ -91,22 +210,31 @@ def _pre_tool_call(
     tool_name: str,
     args: dict[str, Any],
     task_id: str = "",
+    tool_call_id: str = "",
     **_: Any,
 ) -> dict[str, str] | None:
     token = _resolve_token()
     if not token:
         return None  # Not configured — pass through.
 
-    body = {
+    # Ledger first: whatever happens next, this call HAD its pre hook run.
+    _note_pre(_call_key(tool_name, args, tool_call_id))
+
+    body: dict[str, Any] = {
         "tool_name": tool_name,
         "tool_input": args,
         "session_id": task_id,
         "hook_event_name": "PreToolUse",
         "agent_tier": "interactive",
     }
-    result = _post_json("/govern/tool-use", body, token)
+    if tool_call_id:
+        body["call_id"] = tool_call_id
+    result, failure = _post_json_detail("/govern/tool-use", body, token)
     if result is None:
-        return None  # Fail-open on network / parse error.
+        # Fail-open (never-brick) — but record that this call ran with no
+        # verdict, so the next PostToolUse tells the gateway.
+        _note_lapse(tool_name, f"gateway unreachable at PreToolUse: {failure or 'unknown'}")
+        return None
 
     decision = result.get("decision")
     reason = result.get("reason") or "policy did not return a reason"
@@ -134,6 +262,7 @@ def _post_tool_call(
     duration_ms: int = 0,
     status: str = "",
     error_type: str = "",
+    tool_call_id: str = "",
     **_: Any,
 ) -> None:
     output_str = result if isinstance(result, str) else json.dumps(result, default=str)
@@ -159,10 +288,20 @@ def _post_tool_call(
     if not token:
         return
 
+    # Ledger check: did pre_tool_call run for THIS call? If Hermes dispatched
+    # the tool without invoking it, the call ran with no policy check and the
+    # gateway must not record a clean pass.
+    if not _pop_pre(_call_key(tool_name, args, tool_call_id)):
+        _note_lapse(
+            tool_name,
+            "pre-hook-missing: Hermes did not invoke pre_tool_call for this call; "
+            "it ran without a policy check",
+        )
+
     if len(output_str.encode("utf-8")) > POST_HOOK_PAYLOAD_CEILING:
         output_str = output_str[:POST_HOOK_PAYLOAD_CEILING]
 
-    body = {
+    body: dict[str, Any] = {
         "tool_name": tool_name,
         "tool_input": args,
         "tool_output": output_str,
@@ -171,7 +310,14 @@ def _post_tool_call(
         "hook_event_name": "PostToolUse",
         "agent_tier": "interactive",
     }
-    _post_json("/govern/tool-output", body, token)
+    if tool_call_id:
+        body["call_id"] = tool_call_id
+    lapses = _drain_lapses()
+    if lapses:
+        body["pre_lapse"] = lapses
+    posted, _failure = _post_json_detail("/govern/tool-output", body, token)
+    if posted is None:
+        _requeue_lapses(lapses)
 
 
 def _post_api_request(

@@ -171,3 +171,132 @@ def test_register_wires_both_hooks():
     names = [c[0] for c in calls]
     assert "pre_tool_call" in names
     assert "post_tool_call" in names
+
+
+# ---------------------------------------------------------------------------
+# Pre-lapse ledger (0.3.0): a call that ran without a pre-call verdict must
+# reach the gateway as `pre_lapse` on the next PostToolUse, never as a clean
+# pass. Same wire contract as the Claude Code plugin (#902) + call_id (#681).
+# ---------------------------------------------------------------------------
+
+import acp_hermes as _plugin  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fresh_ledger():
+    _plugin._reset_ledger_for_tests()
+    yield
+    _plugin._reset_ledger_for_tests()
+
+
+def _bodies(recorded: list) -> list[dict]:
+    return [json.loads(r.data) for r in recorded]
+
+
+def test_pre_then_post_pairs_by_call_id_and_carries_no_lapse(tmp_path):
+    _write_token(tmp_path)
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"decision": "allow"}, recorded)):
+        _pre_tool_call("terminal", {"command": "ls"}, task_id="t", tool_call_id="call-1")
+        _post_tool_call("terminal", {"command": "ls"}, result="ok", task_id="t", tool_call_id="call-1")
+    pre, post = _bodies(recorded)
+    assert pre["call_id"] == "call-1" and post["call_id"] == "call-1"
+    assert "pre_lapse" not in post
+
+
+def test_post_without_pre_reports_missing_hook_lapse(tmp_path):
+    """The production 2026-09-22 shape: Hermes emitted post_tool_call only."""
+    _write_token(tmp_path)
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass"}, recorded)):
+        _post_tool_call("terminal", {"command": "test_canary"}, result="x", task_id="t", tool_call_id="call-9")
+    (post,) = _bodies(recorded)
+    assert post["hook_event_name"] == "PostToolUse"
+    assert len(post["pre_lapse"]) == 1
+    lapse = post["pre_lapse"][0]
+    assert lapse["tool"] == "terminal"
+    assert lapse["detail"].startswith("pre-hook-missing:")
+    assert len(lapse["at"]) <= 40 and len(lapse["detail"]) <= 200
+
+
+def test_pre_network_failure_is_carried_on_next_post_then_cleared(tmp_path):
+    _write_token(tmp_path)
+
+    def _raise(req, timeout):  # noqa: ARG001
+        raise urllib.error.URLError("connection refused")
+
+    with patch("urllib.request.urlopen", _raise):
+        assert _pre_tool_call("terminal", {"command": "ls"}, task_id="t", tool_call_id="c1") is None
+
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass"}, recorded)):
+        _post_tool_call("terminal", {"command": "ls"}, result="ok", task_id="t", tool_call_id="c1")
+        _post_tool_call("terminal", {"command": "ls"}, result="ok", task_id="t", tool_call_id="c2")
+    first, second = _bodies(recorded)
+    assert len(first["pre_lapse"]) == 1
+    assert first["pre_lapse"][0]["detail"].startswith("gateway unreachable at PreToolUse:")
+    assert "connection refused" in first["pre_lapse"][0]["detail"]
+    # c2 had no pre either, so the second post reports exactly that, not the old lapse.
+    assert len(second["pre_lapse"]) == 1
+    assert second["pre_lapse"][0]["detail"].startswith("pre-hook-missing:")
+
+
+def test_lapses_requeue_when_the_carrying_post_fails(tmp_path):
+    _write_token(tmp_path)
+
+    def _raise(req, timeout):  # noqa: ARG001
+        raise TimeoutError("slow")
+
+    with patch("urllib.request.urlopen", _raise):
+        _pre_tool_call("terminal", {"command": "a"}, task_id="t", tool_call_id="a")
+        _post_tool_call("terminal", {"command": "a"}, result="ok", task_id="t", tool_call_id="a")
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass"}, recorded)):
+        _pre_tool_call("terminal", {"command": "b"}, task_id="t", tool_call_id="b")
+        _post_tool_call("terminal", {"command": "b"}, result="ok", task_id="t", tool_call_id="b")
+    post = _bodies(recorded)[-1]
+    assert [l["tool"] for l in post["pre_lapse"]] == ["terminal"]
+    assert post["pre_lapse"][0]["detail"].startswith("gateway unreachable at PreToolUse:")
+
+
+def test_call_key_falls_back_to_args_digest_without_tool_call_id(tmp_path):
+    _write_token(tmp_path)
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"decision": "allow"}, recorded)):
+        _pre_tool_call("terminal", {"command": "ls"}, task_id="t")
+        _post_tool_call("terminal", {"command": "ls"}, result="ok", task_id="t")
+    pre, post = _bodies(recorded)
+    assert "call_id" not in pre and "call_id" not in post
+    assert "pre_lapse" not in post
+
+
+def test_http_error_on_pre_is_reported_as_http_not_unreachable(tmp_path):
+    _write_token(tmp_path)
+
+    def _raise(req, timeout):  # noqa: ARG001
+        raise urllib.error.HTTPError(req.full_url, 401, "revoked", {}, io.BytesIO(b""))
+
+    with patch("urllib.request.urlopen", _raise):
+        assert _pre_tool_call("terminal", {"command": "ls"}, task_id="t", tool_call_id="h") is None
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass"}, recorded)):
+        _post_tool_call("terminal", {"command": "ls"}, result="ok", task_id="t", tool_call_id="h")
+    (post,) = _bodies(recorded)
+    assert "http 401" in post["pre_lapse"][0]["detail"]
+
+
+def test_client_id_comes_from_package_metadata_or_pinned_fallback():
+    """Wire version == installed dist version (issue #6). From a bare source
+    tree there is no dist metadata, so the pinned fallback must equal
+    pyproject's version — that is the drift check."""
+    import re
+    from importlib.metadata import PackageNotFoundError, version
+    from pathlib import Path
+
+    try:
+        expected = version("acp-hermes")
+    except PackageNotFoundError:
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        expected = re.search(r'^version = "([^"]+)"', pyproject.read_text(), re.M).group(1)
+        assert _plugin._FALLBACK_VERSION == expected, "bump _FALLBACK_VERSION with pyproject"
+    assert _plugin.CLIENT_ID == f"hermes-plugin/{expected}"

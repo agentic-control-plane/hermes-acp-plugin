@@ -288,27 +288,67 @@ def _login_device(creds: Path) -> int:
     return 1
 
 
+def _hermes_hooks_registered() -> tuple[str, str]:
+    """Definitive plugin state, read from Hermes's own plugin manager in-process.
+
+    Returns (state, detail) with state one of:
+      "registered"   — Hermes discovered the plugin AND our pre/post hooks are
+                       in its registry: sessions in this Python env are governed.
+      "not-enabled"  — discovered but no hooks: `hermes plugins enable acp` missing
+                       (external plugins are opt-in; until enabled, sessions run
+                       and send us nothing — the 2026-09-22 sandbox finding).
+      "no-hermes"    — hermes_cli not importable from this interpreter.
+      "error"        — discovery raised; detail has the message.
+    The old `hermes plugins list` substring check was wrong: bundled
+    "copilot-acp-provider" matches "acp" while our plugin is disabled.
+    """
+    try:
+        from hermes_cli import plugins as _hp  # type: ignore
+    except Exception:
+        return "no-hermes", "hermes_cli is not importable from this interpreter"
+    try:
+        mgr = _hp.get_plugin_manager()
+        mgr.discover_and_load()
+        hooks = getattr(mgr, "_hooks", {}) or {}
+        pre = [c for c in hooks.get("pre_tool_call", []) if getattr(c, "__module__", "") == "acp_hermes"]
+        post = [c for c in hooks.get("post_tool_call", []) if getattr(c, "__module__", "") == "acp_hermes"]
+        if pre and post:
+            return "registered", "pre_tool_call + post_tool_call registered"
+        if pre or post:
+            return "error", f"partial registration (pre={len(pre)}, post={len(post)})"
+        return "not-enabled", "plugin present but no hooks registered"
+    except Exception as exc:  # never let a diagnostic crash the CLI
+        return "error", f"{type(exc).__name__}: {exc}"
+
+
+def _report_hermes_state() -> str:
+    state, detail = _hermes_hooks_registered()
+    if state == "registered":
+        sys.stderr.write("Hermes plugin: enabled, hooks registered.\n")
+    elif state == "not-enabled":
+        sys.stderr.write("Hermes plugin NOT enabled — run: hermes plugins enable acp\n")
+    elif state == "no-hermes":
+        import shutil
+        hermes = shutil.which("hermes")
+        if hermes:
+            sys.stderr.write(
+                f"Hermes is installed ({hermes}) but not importable from this Python — "
+                "install acp-hermes into Hermes's own environment, then re-run.\n"
+            )
+        else:
+            sys.stderr.write("`hermes` not on PATH — plugin state unknown.\n")
+    else:
+        sys.stderr.write(f"Could not determine Hermes plugin state ({detail}).\n")
+    return state
+
+
 def cmd_status(_: argparse.Namespace) -> int:
     creds = _credentials_path()
     if not creds.exists():
         sys.stderr.write("Not configured. Run `hermes-acp login`.\n")
         return 1
     sys.stderr.write(f"Credentials present at {creds}\n")
-    import shutil
-    import subprocess
-    hermes = shutil.which("hermes")
-    if hermes:
-        try:
-            proc = subprocess.run([hermes, "plugins", "list"], capture_output=True, timeout=30, text=True)
-            listed = (proc.stdout or "") + (proc.stderr or "")
-            if proc.returncode == 0 and "acp" in listed:
-                sys.stderr.write("Hermes plugin: enabled.\n")
-            else:
-                sys.stderr.write("Hermes plugin NOT enabled — run: hermes plugins enable acp\n")
-        except (OSError, subprocess.SubprocessError):
-            sys.stderr.write("Could not query Hermes plugin state (hermes plugins list failed).\n")
-    else:
-        sys.stderr.write("`hermes` not on PATH — plugin state unknown.\n")
+    _report_hermes_state()
     try:
         status = _get(f"{_api_base()}/govern/health")
         sys.stderr.write(f"Gateway reachable (HTTP {status}).\n")
@@ -316,6 +356,59 @@ def cmd_status(_: argparse.Namespace) -> int:
     except Exception as exc:
         sys.stderr.write(f"Gateway unreachable: {exc}\n")
         return 2
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """End-to-end check that a Hermes tool call in THIS environment is governed.
+
+    Goes further than `status`: after the static checks it pushes one canary
+    call through Hermes's real pre-dispatch entry point
+    (hermes_cli.plugins.resolve_pre_tool_block) and our post hook, then
+    reports what the gateway said. Exit 0 = governed end to end.
+    """
+    from . import _drain_lapses, _post_tool_call, _reset_ledger_for_tests
+
+    creds = _credentials_path()
+    if not creds.exists():
+        sys.stderr.write("✗ Not configured. Run `acp-hermes login`.\n")
+        return 1
+    sys.stderr.write(f"✓ Credentials present at {creds}\n")
+
+    state = _report_hermes_state()
+    if state != "registered":
+        return 3
+
+    try:
+        status = _get(f"{_api_base()}/govern/health")
+        sys.stderr.write(f"✓ Gateway reachable (HTTP {status}) at {_api_base()}\n")
+    except Exception as exc:
+        sys.stderr.write(f"✗ Gateway unreachable: {exc}\n")
+        return 2
+
+    if not getattr(args, "canary", False):
+        sys.stderr.write("Static checks pass. Add --canary to push one real call through Hermes's dispatch path.\n")
+        return 0
+
+    from hermes_cli import plugins as _hp  # type: ignore
+
+    canary_args = {"check": "canary", "note": "acp-hermes doctor"}
+    _reset_ledger_for_tests()
+    try:
+        block = _hp.resolve_pre_tool_block("acp_doctor", canary_args, task_id="acp-doctor", tool_call_id="acp-doctor-1")
+    except Exception as exc:
+        sys.stderr.write(f"✗ Hermes pre-dispatch raised: {type(exc).__name__}: {exc}\n")
+        return 4
+    _post_tool_call("acp_doctor", canary_args, result="canary", task_id="acp-doctor", tool_call_id="acp-doctor-1")
+    leftover = _drain_lapses()
+    if leftover:
+        sys.stderr.write(f"✗ Canary ran but the pre-call check lapsed: {leftover[0]['detail']}\n")
+        return 5
+    verdict = "blocked" if block else "allowed"
+    sys.stderr.write(
+        f"✓ Canary governed end to end (pre verdict: {verdict}). "
+        "Look for tool `acp_doctor` in your ACP console activity.\n"
+    )
+    return 0
 
 
 def cmd_logout(_: argparse.Namespace) -> int:
@@ -548,6 +641,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_status = sub.add_parser("status", help="Show credential and gateway status")
     p_status.set_defaults(func=cmd_status)
+
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Prove a Hermes tool call is governed here: hooks registered, gateway reachable, optional canary through Hermes's real dispatch path",
+    )
+    p_doctor.add_argument("--canary", action="store_true", help="Push one `acp_doctor` call through Hermes's pre-dispatch + our post hook and report the verdict")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_logout = sub.add_parser("logout", help="Remove ~/.acp/credentials")
     p_logout.set_defaults(func=cmd_logout)
