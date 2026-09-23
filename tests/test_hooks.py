@@ -143,6 +143,22 @@ def test_post_observational_no_return(tmp_path):
     assert result is None
 
 
+def test_post_shows_gateway_notice_on_stderr(tmp_path, capsys):
+    _write_token(tmp_path)
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass", "notice": "[ACP cost] Context is 400k tokens."})):
+        result = _post_tool_call("terminal", {"command": "ls"}, result="ok", task_id="t", duration_ms=1)
+    assert result is None
+    assert "[ACP cost] Context is 400k tokens." in capsys.readouterr().err
+
+
+def test_post_notice_silenced_by_acp_shadow_off(tmp_path, capsys, monkeypatch):
+    _write_token(tmp_path)
+    monkeypatch.setenv("ACP_SHADOW", "off")
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass", "notice": "[ACP cost] x"})):
+        _post_tool_call("terminal", {}, result="ok", task_id="t", duration_ms=1)
+    assert "[ACP cost] x" not in capsys.readouterr().err
+
+
 def test_post_truncates_large_payload(tmp_path):
     _write_token(tmp_path)
     big = "x" * (300 * 1024)  # 300 KB, over the 200 KB ceiling
