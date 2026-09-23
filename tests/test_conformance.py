@@ -97,8 +97,14 @@ def test_worktree_module_is_under_test() -> None:
     # Guards against a bad PYTHONPATH silently exercising an installed copy
     # (e.g. the primary checkout's .venv site-packages) instead of this
     # worktree's src/.
-    assert "hermes-acp-plugin-conf" in acp_hermes.__file__, (
-        f"acp_hermes imported from {acp_hermes.__file__!r}, not this worktree — "
+    # Must hold in any checkout (a CI clone, a worktree), so compare against
+    # this repo's own src/ rather than a folder name.
+    from pathlib import Path
+
+    repo_src = (Path(__file__).resolve().parents[1] / "src").resolve()
+    module = Path(acp_hermes.__file__).resolve()
+    assert repo_src in module.parents, (
+        f"acp_hermes imported from {str(module)!r}, not {str(repo_src)!r} — "
         "check PYTHONPATH"
     )
 
