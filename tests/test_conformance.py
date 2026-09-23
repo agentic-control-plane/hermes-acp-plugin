@@ -69,18 +69,8 @@ PLUGIN_ROWS = {
 # until the entry is removed), and the full list is checked against every
 # case's actual outcome (so an undeclared NEW failure also turns this file
 # red instead of silently passing).
-EXPECTED_DIVERGENCES = [
-    {
-        "case": "notice-shown",
-        "issue": "#1334",
-        "detail": (
-            "_post_tool_call() in src/acp_hermes/__init__.py calls "
-            "_post_json('/govern/tool-output', ...) and discards the return "
-            "value entirely — no code path reads result.get('notice'), so "
-            "the marker never reaches stdout, stderr, or any logger."
-        ),
-    },
-]
+# #1334 (notice-shown) was fixed on this branch; no divergences remain.
+EXPECTED_DIVERGENCES: list[dict] = []
 _DIVERGENT_CASE_IDS = {d["case"] for d in EXPECTED_DIVERGENCES}
 
 

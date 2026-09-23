@@ -52,7 +52,7 @@ from . import local_store, pricing
 # Only used when the package is imported from a source tree without dist
 # metadata (tests, `python -m` from a checkout). tests/test_cli.py pins it
 # to pyproject's version so a release bump can't leave it behind again.
-_FALLBACK_VERSION = "0.3.0"
+_FALLBACK_VERSION = "0.3.1"
 
 
 def _dist_version() -> str:
