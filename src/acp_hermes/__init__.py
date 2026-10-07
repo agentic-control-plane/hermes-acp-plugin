@@ -52,7 +52,7 @@ from . import local_store, pricing
 # Only used when the package is imported from a source tree without dist
 # metadata (tests, `python -m` from a checkout). tests/test_cli.py pins it
 # to pyproject's version so a release bump can't leave it behind again.
-_FALLBACK_VERSION = "0.3.0"
+_FALLBACK_VERSION = "0.3.1"
 
 
 def _dist_version() -> str:
@@ -202,6 +202,10 @@ def _post_json(path: str, body: dict[str, Any], token: str) -> dict[str, Any] | 
     return _post_json_detail(path, body, token)[0]
 
 
+def _notices_off() -> bool:
+    return os.environ.get("ACP_SHADOW", "").strip().lower() in ("off", "0", "false")
+
+
 def _block(message: str) -> dict[str, str]:
     return {"action": "block", "message": message}
 
@@ -318,6 +322,13 @@ def _post_tool_call(
     posted, _failure = _post_json_detail("/govern/tool-output", body, token)
     if posted is None:
         _requeue_lapses(lapses)
+    # Gateway notices (cost advisories, shadow) ride `notice`. Hermes has no
+    # message channel on the post hook, so they go to stderr, the surface this
+    # plugin already uses for the person. Same contract as the Claude Code
+    # plugin: ACP_SHADOW=off silences them (gatewaystack-connect#1334).
+    notice = posted.get("notice") if isinstance(posted, dict) else None
+    if isinstance(notice, str) and notice.strip() and not _notices_off():
+        sys.stderr.write(notice.strip()[:2000] + "\n")
 
 
 def _post_api_request(
