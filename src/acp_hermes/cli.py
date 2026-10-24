@@ -621,8 +621,11 @@ def cmd_proxy_setup(args: argparse.Namespace) -> int:
             print(f"✗ Verify call failed: {e}")
             if b"Unknown model" in body:
                 print("  The proxy doesn't route this model id — check the model name.")
-            elif getattr(e, "code", None) == 401:
-                print("  Auth failed — re-run `acp-hermes login`.")
+            elif b"workspace_deleted" in body:
+                # Same cause the governance hook names (gatewaystack-connect#1693).
+                print("  The ACP workspace this key belongs to has been deleted — re-run `acp-hermes login` to connect a new one.")
+            elif getattr(e, "code", None) in (401, 403):
+                print("  Auth failed — the ACP key is revoked or invalid; re-run `acp-hermes login`.")
             else:
                 print("  Likely missing provider key for this model's route — add it in the console: Settings → Model keys.")
             return 1
