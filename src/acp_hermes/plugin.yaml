@@ -1,5 +1,5 @@
 name: acp
-version: 0.2.0
+version: 0.3.2
 description: ACP — govern every tool call, and meter cost & quality locally so agents can self-optimize.
 author: GatewayStack
 homepage: https://agenticcontrolplane.com

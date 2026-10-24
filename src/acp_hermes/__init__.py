@@ -38,6 +38,7 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import urllib.error
@@ -52,7 +53,7 @@ from . import local_store, pricing
 # Only used when the package is imported from a source tree without dist
 # metadata (tests, `python -m` from a checkout). tests/test_cli.py pins it
 # to pyproject's version so a release bump can't leave it behind again.
-_FALLBACK_VERSION = "0.3.1"
+_FALLBACK_VERSION = "0.3.2"
 
 
 def _dist_version() -> str:
@@ -161,11 +162,80 @@ def _resolve_token() -> str | None:
         return None
 
 
-def _post_json_detail(
+KEY_REJECTED_FIX = (
+    "Fix: re-run the installer (curl -sf https://agenticcontrolplane.com/install.sh | bash) "
+    "or create a key at https://cloud.agenticcontrolplane.com/settings/api-keys and save it: "
+    "echo 'gsk_...' > ~/.acp/credentials"
+)
+WORKSPACE_DELETED_FIX = (
+    "The ACP workspace this machine was connected to has been deleted. To remove ACP from "
+    "this machine: acp-uninstall (older installs without it: curl -sf "
+    "https://agenticcontrolplane.com/uninstall.sh | bash). To keep using ACP, re-run the "
+    "installer: curl -sf https://agenticcontrolplane.com/install.sh | bash"
+)
+_DELETED_NOTICE_WINDOW_SECONDS = 24 * 60 * 60
+
+
+def _lapse_line(fields: dict[str, Any]) -> None:
+    """Append to ~/.acp/lapse.log, the local record shared by every ACP harness
+    plugin. Best-effort — never block a call on it."""
+    try:
+        acp_dir = Path.home() / ".acp"
+        acp_dir.mkdir(parents=True, exist_ok=True)
+        line = {
+            "at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "client": "hermes-plugin",
+            **fields,
+        }
+        with open(acp_dir / "lapse.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+    except Exception:
+        pass
+
+
+def _first_deleted_notice(session_id: str) -> bool:
+    """True the first time the workspace-deleted notice is asked for in a
+    session, False after (~/.acp/notices/workspace-deleted.<session>, created
+    exclusively — the same marker the other harness plugins use). With no
+    session id, at most once per 24h via a timestamp marker. Fails toward
+    showing: an unwritable marker repeats, never vanishes."""
+    sid = re.sub(r"[^A-Za-z0-9._-]", "_", str(session_id or ""))[:120]
+    notices = Path.home() / ".acp" / "notices"
+    try:
+        notices.mkdir(parents=True, exist_ok=True)
+        now = _dt.datetime.now(_dt.timezone.utc)
+        stamp = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+        if not sid or sid == "unknown":
+            marker = notices / "workspace-deleted.no-session"
+            last = 0.0
+            try:
+                raw = marker.read_text(encoding="utf-8").strip()
+                last = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            except (OSError, ValueError):
+                pass
+            if now.timestamp() - last < _DELETED_NOTICE_WINDOW_SECONDS:
+                return False
+            marker.write_text(stamp, encoding="utf-8")
+            return True
+        fd = os.open(notices / f"workspace-deleted.{sid}", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, stamp.encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        return True
+
+
+def _post_json_full(
     path: str, body: dict[str, Any], token: str
-) -> tuple[dict[str, Any] | None, str | None]:
-    """POST and return (parsed_json, failure_detail). Exactly one is None.
-    The detail is what a pre-lapse report carries, so it names the cause."""
+) -> tuple[dict[str, Any] | None, str | None, int | None, str | None]:
+    """POST and return (parsed_json, failure_detail, http_status, body_code).
+    Exactly one of parsed_json / failure_detail is None. http_status and
+    body_code are set only for an HTTP error answer; body_code is a 4xx
+    body's machine-readable `code` (e.g. "workspace_deleted")."""
     url = f"{_api_base()}{path}"
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -182,20 +252,64 @@ def _post_json_detail(
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
             raw = resp.read()
             if not raw:
-                return {}, None
+                return {}, None, None, None
             try:
-                return json.loads(raw), None
+                return json.loads(raw), None, None, None
             except json.JSONDecodeError:
-                return None, "unparseable gateway response"
+                return None, "unparseable gateway response", None, None
     except urllib.error.HTTPError as exc:
-        # 4xx/5xx: the gateway answered but did not decide (401 revoked key,
-        # 429, 5xx). Report it as what it is, not as "unreachable".
+        code: str | None = None
+        if 400 <= exc.code < 500:
+            try:
+                parsed = json.loads(exc.read() or b"null")
+                if isinstance(parsed, dict) and isinstance(parsed.get("code"), str):
+                    code = parsed["code"]
+            except Exception:
+                pass
+        if exc.code in (401, 403):
+            # A rejected key, not an outage — the caller names it (#1693).
+            return None, f"key rejected (HTTP {exc.code})", exc.code, code
+        # 4xx/5xx: the gateway answered but did not decide (429, 5xx).
+        # Report it as what it is, not as "unreachable".
         sys.stderr.write(f"[ACP] gateway returned HTTP {exc.code}; failing open\n")
-        return None, f"http {exc.code}"
+        return None, f"http {exc.code}", exc.code, code
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
         sys.stderr.write(f"[ACP] gateway unreachable ({exc}); failing open\n")
         reason = getattr(exc, "reason", None) or exc
-        return None, f"{type(exc).__name__}: {reason}"
+        return None, f"{type(exc).__name__}: {reason}", None, None
+
+
+def _post_json_detail(
+    path: str, body: dict[str, Any], token: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """POST and return (parsed_json, failure_detail). Exactly one is None.
+    The detail is what a pre-lapse report carries, so it names the cause."""
+    result, failure, _status, _code = _post_json_full(path, body, token)
+    return result, failure
+
+
+def _key_rejected(tool_name: str, status: int, code: str | None, session_id: str) -> None:
+    """A 401/403 is NOT the gateway being down — it is this machine's key being
+    revoked, mistyped, or from a deleted workspace. Reading it as "gateway
+    returned HTTP 401" left a user running ungoverned believing it was our
+    outage. Hermes has no unattended tier (every call is "interactive" and the
+    plugin fails open everywhere), so the call proceeds; the lapse is logged
+    and the message names the cause and the fix. `code: "workspace_deleted"`:
+    the owner deleted the workspace on purpose — say so once per session, then
+    proceed silently while still logging the lapse. (gatewaystack-connect#1693,
+    ported from codex-acp-plugin / pi-acp-plugin.)"""
+    detail = f"key rejected (HTTP {status})"
+    _note_lapse(tool_name, f"key rejected at PreToolUse: http {status}")
+    _lapse_line({"kind": "UNGOVERNED", "tool": tool_name, "session": session_id, "detail": detail})
+    deleted = code == "workspace_deleted"
+    if deleted and not _first_deleted_notice(session_id):
+        return
+    fix = WORKSPACE_DELETED_FIX if deleted else KEY_REJECTED_FIX
+    sys.stderr.write(
+        f"[ACP] ⚠ KEY REJECTED (HTTP {status}): the key in ~/.acp/credentials is revoked or "
+        f"invalid — this call proceeded UNGOVERNED and unlogged, and every call will until it "
+        f"is fixed. {fix}\n"
+    )
 
 
 def _post_json(path: str, body: dict[str, Any], token: str) -> dict[str, Any] | None:
@@ -233,7 +347,10 @@ def _pre_tool_call(
     }
     if tool_call_id:
         body["call_id"] = tool_call_id
-    result, failure = _post_json_detail("/govern/tool-use", body, token)
+    result, failure, status, code = _post_json_full("/govern/tool-use", body, token)
+    if result is None and status in (401, 403):
+        _key_rejected(tool_name, status, code, task_id)
+        return None
     if result is None:
         # Fail-open (never-brick) — but record that this call ran with no
         # verdict, so the next PostToolUse tells the gateway.
