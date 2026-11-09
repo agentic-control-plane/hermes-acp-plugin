@@ -9,7 +9,7 @@
 Two planes, one plugin:
 
 - **Local metering (no account, nothing leaves your machine):** every model call and tool call your Hermes agent makes is metered into a local SQLite DB. `acp-hermes report` shows spend by model, cache hit rate, what actually fills your context, tool error rates, and cost per task. `report --json` gives agents their own economics so they can self-optimize.
-- **Cloud governance (optional, free up to 5 agents; run `acp-hermes login`):** every tool call is checked against server-side policy (deny / ask / allow with inline approvals), audited with tenant + session attribution, and visible on a team dashboard across all your machines.
+- **Cloud governance (optional, free up to 5 agents; run `acp-hermes login`):** every tool call is checked against server-side policy (deny / ask / allow, with approvals on the console or by email), audited with tenant + session attribution, and visible on a team dashboard across all your machines.
 
 Companion to the [Claude Code ACP plugin](https://github.com/agentic-control-plane/claude-code-acp-plugin). Same backend contract, same dashboard, same policies, wired into Hermes's Python plugin system instead of Claude Code's shell hooks.
 
@@ -120,7 +120,7 @@ Network errors, timeouts (>4s), malformed responses, a full disk, or a locked SQ
 
 ### "Ask" semantic
 
-An ACP `ask` decision escalates to **Hermes's native approval gate**, the same inline `[o]nce / [s]ession / [a]lways / [d]eny` prompt Hermes uses for dangerous shell commands. An `[a]lways` answer is scoped to the tool via the plugin's `rule_key` (`acp:<tool>`), so a standing approval never widens beyond the tool the human actually reviewed. (Versions ≤0.1.0 wrongly claimed Hermes had no approval surface and hard-blocked with a dashboard detour. Upgrade.)
+Today the gateway does not send asks to Hermes, so a hold is blocked with a system message: approve it on the console or from the email, then retry. The plugin can render an ACP `ask` through **Hermes's native approval gate** once the gateway sends asks to Hermes, the same inline `[o]nce / [s]ession / [a]lways / [d]eny` prompt Hermes uses for dangerous shell commands. An `[a]lways` answer is scoped to the tool via the plugin's `rule_key` (`acp:<tool>`), so a standing approval never widens beyond the tool the human actually reviewed. (Versions ≤0.1.0 wrongly claimed Hermes had no approval surface and hard-blocked with a dashboard detour. Upgrade.)
 
 ### Client identity
 
