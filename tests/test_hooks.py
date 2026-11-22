@@ -562,7 +562,10 @@ def test_personal_data_notice_silenced_by_acp_shadow_off(tmp_path, capsys, monke
     _write_token(tmp_path)
     monkeypatch.setenv("ACP_SHADOW", "off")
     hooks = _registered()
-    reply = {"modified_tool_response": "[REDACTED:email]", "pii": {"types": ["email"], "count": 1}}
+    reply = {
+        "modified_tool_response": "[REDACTED:email]",
+        "pii": {"types": ["email"], "count": 1, "applied": True},
+    }
     with patch("urllib.request.urlopen", _fake_urlopen(reply)):
         assert _run_call(hooks, "a@b.co") == "[REDACTED:email]"
     assert "Personal data" not in capsys.readouterr().err
@@ -600,6 +603,191 @@ def test_pre_lapse_rides_the_transform_post(tmp_path):
         _run_call(hooks, "ok", call_id="no-pre")
     (post,) = _tool_output_bodies(recorded)
     assert post["pre_lapse"][0]["detail"].startswith("pre-hook-missing:")
+
+
+REJECTED_REWRITE_REPLY = {
+    # Redact mode always carries modified_output; the gateway's own re-check
+    # rejected the rewrite, so modified_tool_response is absent and applied is false.
+    "action": "redact",
+    "modified_output": "mail [X] and [REDACTED:email]",
+    "pii": {"types": ["email"], "count": 2, "action": "detected", "applied": False},
+}
+
+
+def test_applied_false_with_modified_output_is_not_a_rewrite(tmp_path, capsys):
+    _write_token(tmp_path)
+    hooks = _registered()
+    with patch("urllib.request.urlopen", _fake_urlopen(REJECTED_REWRITE_REPLY)):
+        assert _run_call(hooks, "mail a@b.co and [REDACTED:email]") is None
+    err = capsys.readouterr().err
+    assert "emov" not in err
+    assert "Personal data found" in err and "unchanged" in err
+
+
+def test_applied_false_keeps_gateway_not_removed_notice(tmp_path, capsys):
+    _write_token(tmp_path)
+    hooks = _registered()
+    reply = dict(
+        REJECTED_REWRITE_REPLY,
+        notice="[ACP] Personal data found (2 email); the model saw it unchanged.",
+    )
+    with patch("urllib.request.urlopen", _fake_urlopen(reply)):
+        assert _run_call(hooks, "mail a@b.co and [REDACTED:email]") is None
+    err = capsys.readouterr().err
+    assert "the model saw it unchanged" in err and "emov" not in err
+
+
+def test_applied_true_rewrites_from_modified_output(tmp_path, capsys):
+    _write_token(tmp_path)
+    hooks = _registered()
+    reply = dict(REJECTED_REWRITE_REPLY, pii={"types": ["email"], "count": 2, "applied": True})
+    with patch("urllib.request.urlopen", _fake_urlopen(reply)):
+        out = _run_call(hooks, "mail a@b.co and [REDACTED:email]")
+    assert out == "mail [X] and [REDACTED:email]"
+    assert "Personal data removed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("pii", [{"types": ["email"], "count": 1}, {"applied": "true"}, None, "x"])
+def test_pii_present_without_applied_true_is_not_a_rewrite(tmp_path, pii):
+    _write_token(tmp_path)
+    hooks = _registered()
+    reply = {"modified_tool_response": "[REDACTED:email]", "pii": pii}
+    with patch("urllib.request.urlopen", _fake_urlopen(reply)):
+        assert _run_call(hooks, "a@b.co") is None
+
+
+def _fake_hermes_hooks(monkeypatch, names):
+    import sys
+    import types
+
+    pkg = types.ModuleType("hermes_cli")
+    mod = types.ModuleType("hermes_cli.plugins")
+    mod.VALID_HOOKS = set(names)
+    pkg.plugins = mod
+    monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", mod)
+
+
+def test_hermes_hook_list_without_transform_keeps_todays_behaviour(tmp_path, monkeypatch):
+    """Hermes warns about an unknown hook name but stores it anyway, so
+    register_hook succeeding is no proof. Its hook list decides."""
+    _write_token(tmp_path)
+    _fake_hermes_hooks(monkeypatch, {"pre_tool_call", "post_tool_call"})
+    ctx = _Ctx()  # accepts every name, like Hermes's warn-and-store
+    register(ctx)
+    assert "transform_tool_result" not in ctx.hooks
+    assert _plugin._transform_registered is False
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass"}, recorded)):
+        ctx.hooks["post_tool_call"]("terminal", {}, result="ok", task_id="t", tool_call_id="c1")
+    (post,) = _tool_output_bodies(recorded)
+    assert "capabilities" not in post
+
+
+def test_hermes_hook_list_with_transform_registers_it(tmp_path, monkeypatch):
+    _write_token(tmp_path)
+    _fake_hermes_hooks(monkeypatch, {"pre_tool_call", "post_tool_call", "transform_tool_result"})
+    ctx = _Ctx()
+    register(ctx)
+    assert ctx.hooks["transform_tool_result"] is _plugin._transform_tool_result
+    assert _plugin._transform_registered is True
+
+
+def test_hermes_hook_list_with_transform_but_register_raises(tmp_path, monkeypatch):
+    _fake_hermes_hooks(monkeypatch, {"transform_tool_result"})
+    register(_Ctx(reject=("transform_tool_result",)))
+    assert _plugin._transform_registered is False
+
+
+@pytest.mark.parametrize(
+    "status,error_type",
+    [
+        ("blocked", "policy"),
+        ("timeout", "tool_timeout"),
+        ("cancelled", "keyboard_interrupt"),
+        ("error", "RuntimeError"),
+        ("error", "invalid_tool_arguments"),
+    ],
+)
+def test_calls_with_no_transform_are_sent_at_once(tmp_path, status, error_type):
+    _write_token(tmp_path)
+    hooks = _registered()
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass"}, recorded)):
+        hooks["post_tool_call"](
+            "terminal", {}, result="nope", task_id="t", tool_call_id="c1",
+            status=status, error_type=error_type,
+        )
+        (post,) = _tool_output_bodies(recorded)
+        assert post["call_id"] == "c1" and "capabilities" not in post
+        assert _plugin._pending_posts == {}
+        # A transform that does arrive finds nothing and asks for nothing.
+        assert hooks["transform_tool_result"](
+            tool_name="terminal", args={}, result="nope", tool_call_id="c1"
+        ) is None
+    assert len(_tool_output_bodies(recorded)) == 1
+
+
+@pytest.mark.parametrize("status,error_type", [("ok", ""), ("", ""), ("error", "tool_error")])
+def test_rewritable_results_are_parked_for_the_transform(tmp_path, status, error_type):
+    _write_token(tmp_path)
+    hooks = _registered()
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass"}, recorded)):
+        hooks["post_tool_call"](
+            "terminal", {}, result="out", task_id="t", tool_call_id="c1",
+            status=status, error_type=error_type,
+        )
+        assert recorded == []
+        hooks["transform_tool_result"](tool_name="terminal", args={}, result="out", tool_call_id="c1")
+    (post,) = _tool_output_bodies(recorded)
+    assert post["capabilities"] == ["output_rewrite"]
+
+
+def test_exit_flush_is_bounded_and_drops_the_rest_with_one_warning(tmp_path, capsys, monkeypatch):
+    _write_token(tmp_path)
+    hooks = _registered()
+    for i in range(10):
+        with _plugin._ledger_lock:
+            _plugin._pending_posts[f"k{i}"] = {
+                "body": {"tool_name": "terminal", "call_id": f"c{i}"},
+                "lapses": [], "token": "t", "tool": "terminal", "thread": -1, "original": None,
+            }
+    clock = [0.0]
+    monkeypatch.setattr(_plugin.time, "monotonic", lambda: clock[0])
+    timeouts: list = []
+
+    def slow(req, timeout):
+        timeouts.append(timeout)
+        clock[0] += timeout  # each send uses its whole allowance
+        raise TimeoutError("timed out")
+
+    with patch("urllib.request.urlopen", slow):
+        _plugin._flush_pending_posts()
+    assert sum(timeouts) <= _plugin.EXIT_FLUSH_BUDGET_SECONDS + 1e-9
+    assert all(t <= _plugin.REQUEST_TIMEOUT_SECONDS for t in timeouts)
+    assert len(timeouts) < 10
+    err = capsys.readouterr().err
+    assert err.count("not sent within") == 1
+    assert f"{10 - len(timeouts)} tool-call audit record(s)" in err
+    assert _plugin._pending_posts == {}
+    del hooks
+
+
+def test_exit_flush_sends_everything_when_fast(tmp_path):
+    _write_token(tmp_path)
+    hooks = _registered()
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass"}, recorded)):
+        for i in range(3):
+            with _plugin._ledger_lock:
+                _plugin._pending_posts[f"k{i}"] = {
+                    "body": {"call_id": f"c{i}"}, "lapses": [], "token": "t",
+                    "tool": "terminal", "thread": -1, "original": None,
+                }
+        _plugin._flush_pending_posts()
+    assert [b["call_id"] for b in _tool_output_bodies(recorded)] == ["c0", "c1", "c2"]
+    del hooks
 
 
 def test_client_id_comes_from_package_metadata_or_pinned_fallback():

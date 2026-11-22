@@ -53,6 +53,7 @@ import os
 import re
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
@@ -107,6 +108,9 @@ PENDING_POSTS_MAX = 64
 # call key -> {"body", "lapses", "token", "tool", "thread", "original"}
 _pending_posts: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 REWRITE_CAPABILITY = "output_rewrite"
+_NO_TRANSFORM_STATUSES = frozenset({"blocked", "timeout", "cancelled"})
+# Total time the exit flush may spend sending parked posts.
+EXIT_FLUSH_BUDGET_SECONDS = 5.0
 
 
 def _call_key(tool_name: str, args: Any, tool_call_id: str) -> str:
@@ -254,7 +258,7 @@ def _first_deleted_notice(session_id: str) -> bool:
 
 
 def _post_json_full(
-    path: str, body: dict[str, Any], token: str
+    path: str, body: dict[str, Any], token: str, timeout: float | None = None
 ) -> tuple[dict[str, Any] | None, str | None, int | None, str | None]:
     """POST and return (parsed_json, failure_detail, http_status, body_code).
     Exactly one of parsed_json / failure_detail is None. http_status and
@@ -273,7 +277,9 @@ def _post_json_full(
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(
+            req, timeout=REQUEST_TIMEOUT_SECONDS if timeout is None else timeout
+        ) as resp:
             raw = resp.read()
             if not raw:
                 return {}, None, None, None
@@ -304,11 +310,11 @@ def _post_json_full(
 
 
 def _post_json_detail(
-    path: str, body: dict[str, Any], token: str
+    path: str, body: dict[str, Any], token: str, timeout: float | None = None
 ) -> tuple[dict[str, Any] | None, str | None]:
     """POST and return (parsed_json, failure_detail). Exactly one is None.
     The detail is what a pre-lapse report carries, so it names the cause."""
-    result, failure, _status, _code = _post_json_full(path, body, token)
+    result, failure, _status, _code = _post_json_full(path, body, token, timeout)
     return result, failure
 
 
@@ -463,7 +469,7 @@ def _post_tool_call(
     if lapses:
         body["pre_lapse"] = lapses
     entry: dict[str, Any] = {"body": body, "lapses": lapses, "token": token, "tool": tool_name}
-    if _transform_registered:
+    if _transform_registered and _transform_follows(status, error_type):
         # transform_tool_result sends this one, so the gateway sees the call
         # once. Only a whole, untruncated string result may be rewritten.
         entry["thread"] = threading.get_ident()
@@ -471,6 +477,22 @@ def _post_tool_call(
         _park_post(key, entry)
         return
     _flush_post(entry)
+
+
+def _transform_follows(status: Any, error_type: Any) -> bool:
+    """Whether Hermes will run transform_tool_result after this post_tool_call.
+
+    Hermes fires post_tool_call with no transform for blocked, timed-out and
+    cancelled calls, and for calls whose dispatch raised (status "error" with
+    the exception's type). Those rows are sent at once instead of parked. A
+    tool that returned an error result (error_type "tool_error") still goes
+    through the transform, so it stays parked and can be rewritten."""
+    s = status if isinstance(status, str) else ""
+    if s in _NO_TRANSFORM_STATUSES:
+        return False
+    if s == "error" and error_type != "tool_error":
+        return False
+    return True
 
 
 def _show_notice(text: Any) -> None:
@@ -482,16 +504,18 @@ def _show_notice(text: Any) -> None:
         sys.stderr.write(text.strip()[:2000] + "\n")
 
 
-def _send_post(entry: dict[str, Any]) -> dict[str, Any] | None:
-    posted, _failure = _post_json_detail("/govern/tool-output", entry["body"], entry["token"])
+def _send_post(entry: dict[str, Any], timeout: float | None = None) -> dict[str, Any] | None:
+    posted, _failure = _post_json_detail(
+        "/govern/tool-output", entry["body"], entry["token"], timeout
+    )
     if posted is None:
         _requeue_lapses(entry["lapses"])
     return posted if isinstance(posted, dict) else None
 
 
-def _flush_post(entry: dict[str, Any]) -> None:
+def _flush_post(entry: dict[str, Any], timeout: float | None = None) -> None:
     """Send a PostToolUse with no rewrite asked for — today's observe path."""
-    posted = _send_post(entry)
+    posted = _send_post(entry, timeout)
     _show_notice(posted.get("notice") if posted else None)
 
 
@@ -513,13 +537,28 @@ def _park_post(key: str, entry: dict[str, Any]) -> None:
         _flush_post(e)
 
 
-def _flush_pending_posts() -> None:
+def _flush_pending_posts(budget: float | None = None) -> None:
+    """Send what is still parked at exit, within one overall time budget so a
+    down gateway cannot hold up exit. Whatever does not fit is dropped with
+    one warning."""
     with _ledger_lock:
         stale = list(_pending_posts.values())
         _pending_posts.clear()
-    for e in stale:
+    limit = EXIT_FLUSH_BUDGET_SECONDS if budget is None else budget
+    deadline = time.monotonic() + limit
+    for i, e in enumerate(stale):
+        remaining = min(REQUEST_TIMEOUT_SECONDS, deadline - time.monotonic())
+        if remaining <= 0.05:
+            try:
+                sys.stderr.write(
+                    f"[ACP] exit: {len(stale) - i} tool-call audit record(s) not sent "
+                    f"within {limit:g}s; dropped\n"
+                )
+            except Exception:
+                pass
+            return
         try:
-            _flush_post(e)
+            _flush_post(e, remaining)
         except Exception:
             pass
 
@@ -563,6 +602,20 @@ def _personal_data_notice(tool_name: str, posted: dict[str, Any], removed: bool)
         )
 
 
+def _rewrite_applied(posted: dict[str, Any]) -> bool:
+    """True when the gateway says its rewrite may replace the result.
+
+    A reply with a `pii` object is authoritative: only `pii.applied is True`
+    counts. In redact mode the gateway always sends `modified_output`, even
+    when its own re-check rejected the rewrite (then `applied` is false), so
+    `modified_output` alone is not proof. A legacy reply with no `pii` key at
+    all keeps the old behaviour and its rewrite fields are trusted."""
+    if "pii" not in posted:
+        return True
+    pii = posted.get("pii")
+    return isinstance(pii, dict) and pii.get("applied") is True
+
+
 def _transform(tool_name: str, args: Any, result: Any, tool_call_id: str) -> str | None:
     key = _call_key(tool_name, args, tool_call_id)
     with _ledger_lock:
@@ -579,7 +632,7 @@ def _transform(tool_name: str, args: Any, result: Any, tool_call_id: str) -> str
     if posted is None:
         return None
     rewritten: str | None = None
-    if rewritable:
+    if rewritable and _rewrite_applied(posted):
         candidate = posted.get("modified_tool_response")
         if not isinstance(candidate, str):
             candidate = posted.get("modified_output")
@@ -726,17 +779,38 @@ def _post_llm_call(
         pass
 
 
+def _host_supports_transform() -> bool | None:
+    """True or False when Hermes's hook list (`hermes_cli.plugins.VALID_HOOKS`)
+    says whether transform_tool_result exists; None when that list cannot be
+    read, in which case register_hook raising is the only signal left."""
+    try:
+        from hermes_cli.plugins import VALID_HOOKS  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        if isinstance(VALID_HOOKS, (set, frozenset, list, tuple, dict)):
+            return "transform_tool_result" in VALID_HOOKS
+    except Exception:
+        pass
+    return None
+
+
 def register(ctx: Any) -> None:
     global _transform_registered, _atexit_armed
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("post_tool_call", _post_tool_call)
-    # Personal data removal. An older Hermes that rejects the hook name keeps
-    # today's behaviour: post_tool_call sends its own PostToolUse.
-    try:
-        ctx.register_hook("transform_tool_result", _transform_tool_result)
-    except Exception:
-        pass
-    else:
+    # Personal data removal. Hermes warns about an unknown hook name but still
+    # stores it, so a successful register_hook call does not prove the hook
+    # will ever run. Ask Hermes's own list of hook names first; an older
+    # Hermes that does not list transform_tool_result keeps today's
+    # behaviour: post_tool_call sends its own PostToolUse.
+    supported = _host_supports_transform()
+    if supported is not False:
+        try:
+            ctx.register_hook("transform_tool_result", _transform_tool_result)
+        except Exception:
+            supported = False
+    if supported is not False:
         _transform_registered = True
         if not _atexit_armed:
             atexit.register(_flush_pending_posts)

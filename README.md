@@ -121,7 +121,10 @@ When you are logged in and your workspace removes personal data, tool results ar
 
 - **Covered:** tool results that are text and no larger than 200 KB. The plugin tells the gateway it can apply a rewrite only for these.
 - **Not covered:** results over 200 KB (the gateway sees a truncated copy, so nothing is replaced) and results that are not text. These still reach the gateway for audit and detection, but the model sees them unchanged.
-- **Older Hermes without `transform_tool_result`:** the plugin loads as before; results are audited but never rewritten.
+- **Rewrites the gateway did not apply:** the plugin replaces a result only when the gateway's reply says the rewrite was applied (`pii.applied: true`). If the gateway's own re-check rejects it, the original is kept and the notice says the model saw it unchanged.
+- **Calls that never reach the transform:** blocked, timed-out and cancelled calls, and calls whose dispatch raised, are sent to the gateway straight from `post_tool_call` for audit and are not rewritten.
+- **Older Hermes without `transform_tool_result`:** the plugin checks Hermes's list of hook names (`hermes_cli.plugins.VALID_HOOKS`). If the hook is not listed, it is not registered and results are audited as before but never rewritten. If that list cannot be read, the plugin falls back to whether registering the hook raises.
+- **At exit:** any audit records still waiting are sent within about 5 seconds in total; the rest are dropped with one warning on stderr.
 - **Any failure** (gateway down, timeout, malformed reply): the original result is kept.
 
 A line on stderr says what happened. It says "removed" only when the plugin actually replaced the result; otherwise it says personal data was found and the model saw it unchanged. `ACP_SHADOW=off` silences it with the other notices. Not yet verified against a live Hermes build.
