@@ -103,16 +103,31 @@ export ACP_API_BASE="https://api.agenticcontrolplane.com"  # default
 
 ## How it works
 
-The plugin registers four Hermes hooks:
+The plugin registers five Hermes hooks:
 
 | Hook               | Plane | Behavior                                                   |
 |--------------------|-------|------------------------------------------------------------|
 | `pre_tool_call`    | cloud | POSTs to `/govern/tool-use`. Server returns `allow` / `deny` / `ask`. `deny` blocks with a system message; `ask` escalates to Hermes's native approval prompt; `allow` passes through. |
-| `post_tool_call`   | both  | Records duration, status, and result size locally; POSTs to `/govern/tool-output` for server-side audit, redaction logging, and DLP scanning when logged in. |
+| `post_tool_call`   | both  | Records duration, status, and result size locally; POSTs to `/govern/tool-output` for server-side audit, redaction logging, and DLP scanning when logged in. When `transform_tool_result` is registered, whichever of the two hooks Hermes runs first for a call sends it, so each call reaches the gateway once. |
+| `transform_tool_result` | cloud | Sends the `/govern/tool-output` request (held by `post_tool_call` if that ran first, otherwise built here) and, if the gateway removed personal data, hands Hermes the rewritten result before the model sees it. Hermes runs it after `post_tool_call` on its concurrent path and before it on its sequential registry path; both orders are handled. |
 | `post_api_request` | local | Records each LLM API request (model, token buckets: input / output / cache read / cache write / reasoning, and latency) and prices it with Hermes's own pricing engine. |
 | `post_llm_call`    | local | Records context composition by role (system / user / assistant / tool results) per turn. |
 
 Local rows land in `~/.acp/hermes-local.db` (SQLite, WAL). Nothing is uploaded from the metering plane.
+
+### Personal data removal
+
+When you are logged in and your workspace removes personal data, tool results are rewritten before the model sees them (Hermes's `transform_tool_result` hook; replaced values read `[REDACTED:<type>]`). What is covered:
+
+- **Covered:** tool results that are text and no larger than 200 KB. The plugin tells the gateway it can apply a rewrite only for these.
+- **Not covered:** results over 200 KB (the gateway sees a truncated copy, so nothing is replaced) and results that are not text. These still reach the gateway for audit and detection, but the model sees them unchanged.
+- **Rewrites the gateway did not apply:** the plugin replaces a result only when the gateway's reply says the rewrite was applied (`pii.applied: true`). If the gateway's own re-check rejects it, the original is kept and the notice says the model saw it unchanged.
+- **Calls that never reach the transform:** blocked, timed-out and cancelled calls, and calls whose dispatch raised, are sent to the gateway straight from `post_tool_call` for audit and are not rewritten.
+- **Older Hermes without `transform_tool_result`:** the plugin checks Hermes's list of hook names (`hermes_cli.plugins.VALID_HOOKS`). If the hook is not listed, it is not registered and results are audited as before but never rewritten. If that list cannot be read, the plugin falls back to whether registering the hook raises.
+- **At exit:** any audit records still waiting are sent within about 5 seconds in total; the rest are dropped with one warning on stderr.
+- **Any failure** (gateway down, timeout, malformed reply): the original result is kept.
+
+A line on stderr says what happened. It says "removed" only when the plugin actually replaced the result; otherwise it says personal data was found and the model saw it unchanged. `ACP_SHADOW=off` silences it with the other notices. Not yet verified against a live Hermes build.
 
 ### Fail-open
 
