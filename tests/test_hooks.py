@@ -851,6 +851,26 @@ def test_transform_first_orders_alternate_across_calls(tmp_path):
     assert all(b["capabilities"] == ["output_rewrite"] for b in _tool_output_bodies(recorded))
 
 
+def test_parked_post_is_sent_when_next_call_runs_transform_first(tmp_path):
+    """A row parked by one call (its transform never ran) must not wait for
+    exit when the following calls take the transform-first order, where
+    post_tool_call never parks."""
+    _write_token(tmp_path)
+    hooks = _registered()
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass"}, recorded)):
+        hooks["post_tool_call"]("terminal", {}, result="one", task_id="t", tool_call_id="c1")
+        assert _tool_output_bodies(recorded) == []
+        out = hooks["transform_tool_result"](
+            tool_name="terminal", args={}, result="two", tool_call_id="c2"
+        )
+        hooks["post_tool_call"]("terminal", {}, result=out, task_id="t", tool_call_id="c2")
+        assert sorted(b["call_id"] for b in _tool_output_bodies(recorded)) == ["c1", "c2"]
+        assert _plugin._pending_posts == {}
+        _plugin._flush_pending_posts()
+    assert len(_tool_output_bodies(recorded)) == 2
+
+
 def test_transform_with_no_post_following_sends_once_and_stays_bounded(tmp_path, monkeypatch):
     _write_token(tmp_path)
     hooks = _registered()

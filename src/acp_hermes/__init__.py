@@ -517,7 +517,9 @@ def _post_tool_call(
     key = _call_key(tool_name, args, tool_call_id)
     if _take_handled(key, "transform"):
         # Transform-first order: transform_tool_result already sent this
-        # call's PostToolUse, so the gateway sees it once.
+        # call's PostToolUse, so the gateway sees it once. Anything this
+        # thread parked earlier was never claimed: send it now.
+        _flush_thread_parked()
         return
 
     entry = _build_entry(key, tool_name, args, result, task_id, duration_ms, tool_call_id, token)
@@ -588,11 +590,26 @@ def _park_post(key: str, entry: dict[str, Any]) -> None:
         old = _pending_posts.pop(key, None)
         if old is not None:
             stale.append(old)
-        for k in [k for k, e in _pending_posts.items() if e["thread"] == entry["thread"]]:
-            stale.append(_pending_posts.pop(k))
+        stale.extend(_pop_thread_parked_locked(entry["thread"]))
         _pending_posts[key] = entry
         while len(_pending_posts) > PENDING_POSTS_MAX:
             stale.append(_pending_posts.popitem(last=False)[1])
+    for e in stale:
+        _flush_post(e)
+
+
+def _pop_thread_parked_locked(thread: int) -> list[dict[str, Any]]:
+    """Remove and return this thread's parked posts. Caller holds _ledger_lock."""
+    keys = [k for k, e in _pending_posts.items() if e["thread"] == thread]
+    return [_pending_posts.pop(k) for k in keys]
+
+
+def _flush_thread_parked() -> None:
+    """Send whatever this thread left parked and unclaimed (see _park_post).
+    Called from the transform-first path too, where post_tool_call never
+    parks, so a row parked earlier is not left waiting until exit."""
+    with _ledger_lock:
+        stale = _pop_thread_parked_locked(threading.get_ident())
     for e in stale:
         _flush_post(e)
 
