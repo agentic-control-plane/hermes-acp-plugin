@@ -30,10 +30,22 @@ ledger and carries any lapse to the gateway as `pre_lapse: [{at, tool,
 detail}]` on the next PostToolUse — the same wire contract the Claude Code
 plugin uses (#902) — so the console shows "ran ungoverned" instead of a
 clean pass. Both hooks also send `call_id` (#681) so the rows pair.
+
+Personal data removal (0.4.0): Hermes's `transform_tool_result` hook runs
+after post_tool_call and before the result reaches the conversation; the
+first string it returns replaces the result. When that hook registers,
+post_tool_call parks its PostToolUse body instead of sending it and
+transform_tool_result sends it (one request per call), declaring
+`capabilities: ["output_rewrite"]` when the whole result is a string the
+gateway saw untruncated. A rewritten string in the reply is returned; any
+failure returns None so Hermes keeps the original. A parked body that no
+transform claims (a Hermes that accepts the hook name but never calls it) is
+sent on the next post_tool_call from the same thread, or at exit.
 """
 
 from __future__ import annotations
 
+import atexit
 import datetime as _dt
 import hashlib
 import json
@@ -53,7 +65,7 @@ from . import local_store, pricing
 # Only used when the package is imported from a source tree without dist
 # metadata (tests, `python -m` from a checkout). tests/test_cli.py pins it
 # to pyproject's version so a release bump can't leave it behind again.
-_FALLBACK_VERSION = "0.3.2"
+_FALLBACK_VERSION = "0.4.0"
 
 
 def _dist_version() -> str:
@@ -86,6 +98,15 @@ _ledger_lock = threading.Lock()
 _pre_ledger: "OrderedDict[str, bool]" = OrderedDict()
 # Lapses waiting to ride the next PostToolUse.
 _pending_lapses: list[dict[str, str]] = []
+
+# transform_tool_result pairing. Set by register() once Hermes accepted the
+# hook; post_tool_call then parks its PostToolUse here for the transform.
+_transform_registered = False
+_atexit_armed = False
+PENDING_POSTS_MAX = 64
+# call key -> {"body", "lapses", "token", "tool", "thread", "original"}
+_pending_posts: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+REWRITE_CAPABILITY = "output_rewrite"
 
 
 def _call_key(tool_name: str, args: Any, tool_call_id: str) -> str:
@@ -142,9 +163,12 @@ def _requeue_lapses(entries: list[dict[str, str]]) -> None:
 
 
 def _reset_ledger_for_tests() -> None:
+    global _transform_registered
     with _ledger_lock:
         _pre_ledger.clear()
         _pending_lapses.clear()
+        _pending_posts.clear()
+        _transform_registered = False
 
 
 def _api_base() -> str:
@@ -412,14 +436,16 @@ def _post_tool_call(
     # Ledger check: did pre_tool_call run for THIS call? If Hermes dispatched
     # the tool without invoking it, the call ran with no policy check and the
     # gateway must not record a clean pass.
-    if not _pop_pre(_call_key(tool_name, args, tool_call_id)):
+    key = _call_key(tool_name, args, tool_call_id)
+    if not _pop_pre(key):
         _note_lapse(
             tool_name,
             "pre-hook-missing: Hermes did not invoke pre_tool_call for this call; "
             "it ran without a policy check",
         )
 
-    if len(output_str.encode("utf-8")) > POST_HOOK_PAYLOAD_CEILING:
+    truncated = len(output_str.encode("utf-8")) > POST_HOOK_PAYLOAD_CEILING
+    if truncated:
         output_str = output_str[:POST_HOOK_PAYLOAD_CEILING]
 
     body: dict[str, Any] = {
@@ -436,16 +462,147 @@ def _post_tool_call(
     lapses = _drain_lapses()
     if lapses:
         body["pre_lapse"] = lapses
-    posted, _failure = _post_json_detail("/govern/tool-output", body, token)
-    if posted is None:
-        _requeue_lapses(lapses)
+    entry: dict[str, Any] = {"body": body, "lapses": lapses, "token": token, "tool": tool_name}
+    if _transform_registered:
+        # transform_tool_result sends this one, so the gateway sees the call
+        # once. Only a whole, untruncated string result may be rewritten.
+        entry["thread"] = threading.get_ident()
+        entry["original"] = result if isinstance(result, str) and not truncated else None
+        _park_post(key, entry)
+        return
+    _flush_post(entry)
+
+
+def _show_notice(text: Any) -> None:
     # Gateway notices (cost advisories, shadow) ride `notice`. Hermes has no
     # message channel on the post hook, so they go to stderr, the surface this
     # plugin already uses for the person. Same contract as the Claude Code
     # plugin: ACP_SHADOW=off silences them (gatewaystack-connect#1334).
-    notice = posted.get("notice") if isinstance(posted, dict) else None
-    if isinstance(notice, str) and notice.strip() and not _notices_off():
-        sys.stderr.write(notice.strip()[:2000] + "\n")
+    if isinstance(text, str) and text.strip() and not _notices_off():
+        sys.stderr.write(text.strip()[:2000] + "\n")
+
+
+def _send_post(entry: dict[str, Any]) -> dict[str, Any] | None:
+    posted, _failure = _post_json_detail("/govern/tool-output", entry["body"], entry["token"])
+    if posted is None:
+        _requeue_lapses(entry["lapses"])
+    return posted if isinstance(posted, dict) else None
+
+
+def _flush_post(entry: dict[str, Any]) -> None:
+    """Send a PostToolUse with no rewrite asked for — today's observe path."""
+    posted = _send_post(entry)
+    _show_notice(posted.get("notice") if posted else None)
+
+
+def _park_post(key: str, entry: dict[str, Any]) -> None:
+    """Hold a PostToolUse for transform_tool_result. Hermes runs the two hooks
+    back to back on one thread, so anything still parked from this thread
+    was never claimed: send it now rather than lose the audit row."""
+    stale: list[dict[str, Any]] = []
+    with _ledger_lock:
+        old = _pending_posts.pop(key, None)
+        if old is not None:
+            stale.append(old)
+        for k in [k for k, e in _pending_posts.items() if e["thread"] == entry["thread"]]:
+            stale.append(_pending_posts.pop(k))
+        _pending_posts[key] = entry
+        while len(_pending_posts) > PENDING_POSTS_MAX:
+            stale.append(_pending_posts.popitem(last=False)[1])
+    for e in stale:
+        _flush_post(e)
+
+
+def _flush_pending_posts() -> None:
+    with _ledger_lock:
+        stale = list(_pending_posts.values())
+        _pending_posts.clear()
+    for e in stale:
+        try:
+            _flush_post(e)
+        except Exception:
+            pass
+
+
+def _types_suffix(pii: dict[str, Any]) -> str:
+    types = pii.get("types")
+    if isinstance(types, list):
+        names = [t for t in types if isinstance(t, str) and t]
+        if names:
+            return f" ({', '.join(names[:10])})"
+    return ""
+
+
+def _personal_data_notice(tool_name: str, posted: dict[str, Any], removed: bool) -> None:
+    """Say what happened to personal data, and only what happened: "removed"
+    only when this hook handed Hermes the rewritten string."""
+    notice = posted.get("notice")
+    pii = posted.get("pii") if isinstance(posted.get("pii"), dict) else {}
+    count = pii.get("count")
+    found = (isinstance(count, int) and not isinstance(count, bool) and count > 0) or bool(
+        _types_suffix(pii)
+    )
+    if removed:
+        if isinstance(notice, str) and notice.strip():
+            _show_notice(notice)
+        else:
+            _show_notice(
+                f"[ACP] Personal data removed from the {tool_name} result before the model "
+                f"saw it{_types_suffix(pii)}."
+            )
+        return
+    claims_removal = isinstance(notice, str) and any(
+        w in notice.lower() for w in ("remov", "redact")
+    )
+    if not claims_removal:
+        _show_notice(notice)
+    if found and (claims_removal or not (isinstance(notice, str) and notice.strip())):
+        _show_notice(
+            f"[ACP] Personal data found in the {tool_name} result{_types_suffix(pii)}; "
+            f"the model saw it unchanged."
+        )
+
+
+def _transform(tool_name: str, args: Any, result: Any, tool_call_id: str) -> str | None:
+    key = _call_key(tool_name, args, tool_call_id)
+    with _ledger_lock:
+        entry = _pending_posts.pop(key, None)
+    if entry is None:
+        return None  # Not logged in, or post_tool_call never ran: nothing to do.
+    original = entry.get("original")
+    # Rewrite only what the gateway saw, whole: the same string Hermes is
+    # about to append to the conversation.
+    rewritable = isinstance(original, str) and isinstance(result, str) and result == original
+    if rewritable:
+        entry["body"]["capabilities"] = [REWRITE_CAPABILITY]
+    posted = _send_post(entry)
+    if posted is None:
+        return None
+    rewritten: str | None = None
+    if rewritable:
+        candidate = posted.get("modified_tool_response")
+        if not isinstance(candidate, str):
+            candidate = posted.get("modified_output")
+        if isinstance(candidate, str) and candidate != original:
+            rewritten = candidate
+    _personal_data_notice(tool_name, posted, removed=rewritten is not None)
+    return rewritten
+
+
+def _transform_tool_result(
+    tool_name: str = "",
+    args: Any = None,
+    result: Any = None,
+    tool_call_id: str = "",
+    **_: Any,
+) -> str | None:
+    """Return the gateway's rewritten result, or None to keep the original.
+    Runs on the conversation path: never raises, never waits past the
+    request timeout."""
+    try:
+        return _transform(tool_name, args, result, tool_call_id)
+    except Exception:
+        return None
 
 
 def _post_api_request(
@@ -570,8 +727,20 @@ def _post_llm_call(
 
 
 def register(ctx: Any) -> None:
+    global _transform_registered, _atexit_armed
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("post_tool_call", _post_tool_call)
+    # Personal data removal. An older Hermes that rejects the hook name keeps
+    # today's behaviour: post_tool_call sends its own PostToolUse.
+    try:
+        ctx.register_hook("transform_tool_result", _transform_tool_result)
+    except Exception:
+        pass
+    else:
+        _transform_registered = True
+        if not _atexit_armed:
+            atexit.register(_flush_pending_posts)
+            _atexit_armed = True
     # Metering hooks — registered individually and fail-open so an older
     # Hermes without these hook names still loads the governance plane.
     for hook, fn in (
