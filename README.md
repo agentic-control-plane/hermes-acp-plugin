@@ -108,8 +108,8 @@ The plugin registers five Hermes hooks:
 | Hook               | Plane | Behavior                                                   |
 |--------------------|-------|------------------------------------------------------------|
 | `pre_tool_call`    | cloud | POSTs to `/govern/tool-use`. Server returns `allow` / `deny` / `ask`. `deny` blocks with a system message; `ask` escalates to Hermes's native approval prompt; `allow` passes through. |
-| `post_tool_call`   | both  | Records duration, status, and result size locally; POSTs to `/govern/tool-output` for server-side audit, redaction logging, and DLP scanning when logged in. When `transform_tool_result` is registered, that hook sends this request instead, so each call reaches the gateway once. |
-| `transform_tool_result` | cloud | Sends the `/govern/tool-output` request and, if the gateway removed personal data, hands Hermes the rewritten result before the model sees it. |
+| `post_tool_call`   | both  | Records duration, status, and result size locally; POSTs to `/govern/tool-output` for server-side audit, redaction logging, and DLP scanning when logged in. When `transform_tool_result` is registered, whichever of the two hooks Hermes runs first for a call sends it, so each call reaches the gateway once. |
+| `transform_tool_result` | cloud | Sends the `/govern/tool-output` request (held by `post_tool_call` if that ran first, otherwise built here) and, if the gateway removed personal data, hands Hermes the rewritten result before the model sees it. Hermes runs it after `post_tool_call` on its concurrent path and before it on its sequential registry path; both orders are handled. |
 | `post_api_request` | local | Records each LLM API request (model, token buckets: input / output / cache read / cache write / reasoning, and latency) and prices it with Hermes's own pricing engine. |
 | `post_llm_call`    | local | Records context composition by role (system / user / assistant / tool results) per turn. |
 

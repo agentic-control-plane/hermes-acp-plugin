@@ -790,6 +790,105 @@ def test_exit_flush_sends_everything_when_fast(tmp_path):
     del hooks
 
 
+APPLIED_REPLY = {
+    "action": "redact",
+    "modified_tool_response": "mail [REDACTED:email]",
+    "modified_output": "mail [REDACTED:email]",
+    "pii": {"types": ["email"], "count": 1, "applied": True},
+}
+
+
+def test_transform_first_order_rewrites_and_post_does_not_send_again(tmp_path):
+    """Hermes's sequential registry path runs transform_tool_result before
+    post_tool_call. The transform sends the request itself."""
+    _write_token(tmp_path)
+    hooks = _registered()
+    recorded: list = []
+    args = {"command": "cat contacts.txt"}
+    with patch("urllib.request.urlopen", _fake_urlopen(APPLIED_REPLY, recorded)):
+        hooks["pre_tool_call"]("terminal", args, task_id="t", tool_call_id="c1")
+        out = hooks["transform_tool_result"](
+            tool_name="terminal", args=args, result="mail a@b.co", task_id="t",
+            tool_call_id="c1", duration_ms=7,
+        )
+        hooks["post_tool_call"](
+            "terminal", args, result=out, task_id="t", tool_call_id="c1", status="ok"
+        )
+    assert out == "mail [REDACTED:email]"
+    (post,) = _tool_output_bodies(recorded)
+    assert post["capabilities"] == ["output_rewrite"]
+    assert post["call_id"] == "c1" and post["tool_output"] == "mail a@b.co"
+    assert post["session_id"] == "t" and post["duration_ms"] == 7
+    assert "pre_lapse" not in post  # pre ran; no spurious lapse from either hook
+    assert _plugin._pending_posts == {} and _plugin._handled_posts == {}
+
+
+def test_post_first_order_still_rewrites_once(tmp_path):
+    _write_token(tmp_path)
+    hooks = _registered()
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen(APPLIED_REPLY, recorded)):
+        out = _run_call(hooks, "mail a@b.co")
+    assert out == "mail [REDACTED:email]"
+    (post,) = _tool_output_bodies(recorded)
+    assert post["capabilities"] == ["output_rewrite"]
+    assert _plugin._pending_posts == {} and _plugin._handled_posts == {}
+
+
+def test_transform_first_orders_alternate_across_calls(tmp_path):
+    _write_token(tmp_path)
+    hooks = _registered()
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen(APPLIED_REPLY, recorded)):
+        for cid in ("c1", "c2"):
+            out = hooks["transform_tool_result"](
+                tool_name="terminal", args={}, result="mail a@b.co", tool_call_id=cid
+            )
+            hooks["post_tool_call"]("terminal", {}, result=out, task_id="t", tool_call_id=cid)
+            assert out == "mail [REDACTED:email]"
+        _run_call(hooks, "mail a@b.co", call_id="c3")
+    assert [b["call_id"] for b in _tool_output_bodies(recorded)] == ["c1", "c2", "c3"]
+    assert all(b["capabilities"] == ["output_rewrite"] for b in _tool_output_bodies(recorded))
+
+
+def test_transform_with_no_post_following_sends_once_and_stays_bounded(tmp_path, monkeypatch):
+    _write_token(tmp_path)
+    hooks = _registered()
+    monkeypatch.setattr(_plugin, "HANDLED_POSTS_MAX", 5)
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen({"action": "pass"}, recorded)):
+        for i in range(20):
+            assert hooks["transform_tool_result"](
+                tool_name="terminal", args={}, result="out", tool_call_id=f"c{i}"
+            ) is None
+        _plugin._flush_pending_posts()
+    assert len(_tool_output_bodies(recorded)) == 20
+    assert len(_plugin._handled_posts) == 5
+    assert _plugin._pending_posts == {}
+
+
+def test_transform_first_non_rewritable_result_declares_no_capability(tmp_path):
+    _write_token(tmp_path)
+    hooks = _registered()
+    recorded: list = []
+    with patch("urllib.request.urlopen", _fake_urlopen(APPLIED_REPLY, recorded)):
+        out = hooks["transform_tool_result"](
+            tool_name="terminal", args={}, result="x" * (300 * 1024), tool_call_id="c1"
+        )
+    assert out is None
+    (post,) = _tool_output_bodies(recorded)
+    assert "capabilities" not in post
+
+
+def test_transform_first_without_token_sends_nothing(tmp_path):
+    hooks = _registered()
+    with patch("urllib.request.urlopen", side_effect=AssertionError("no network expected")):
+        assert hooks["transform_tool_result"](
+            tool_name="terminal", args={}, result="x", tool_call_id="c1"
+        ) is None
+    assert _plugin._handled_posts == {}
+
+
 def test_client_id_comes_from_package_metadata_or_pinned_fallback():
     """Wire version == installed dist version (issue #6). From a bare source
     tree there is no dist metadata, so the pinned fallback must equal

@@ -107,9 +107,15 @@ _atexit_armed = False
 PENDING_POSTS_MAX = 64
 # call key -> {"body", "lapses", "token", "tool", "thread", "original"}
 _pending_posts: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+# Keys whose PostToolUse transform_tool_result already sent because it ran
+# before post_tool_call (Hermes's sequential registry path). Bounded so a
+# transform with no post after it cannot grow this without limit.
+HANDLED_POSTS_MAX = 256
+_handled_posts: "OrderedDict[str, str]" = OrderedDict()
 REWRITE_CAPABILITY = "output_rewrite"
 _NO_TRANSFORM_STATUSES = frozenset({"blocked", "timeout", "cancelled"})
-# Total time the exit flush may spend sending parked posts.
+# About how long the exit flush may spend sending parked posts. Not a hard
+# wall clock: urlopen's timeout applies per socket operation.
 EXIT_FLUSH_BUDGET_SECONDS = 5.0
 
 
@@ -172,6 +178,7 @@ def _reset_ledger_for_tests() -> None:
         _pre_ledger.clear()
         _pending_lapses.clear()
         _pending_posts.clear()
+        _handled_posts.clear()
         _transform_registered = False
 
 
@@ -403,6 +410,74 @@ def _pre_tool_call(
     return None
 
 
+def _build_entry(
+    key: str,
+    tool_name: str,
+    args: Any,
+    result: Any,
+    task_id: str,
+    duration_ms: Any,
+    tool_call_id: str,
+    token: str,
+) -> dict[str, Any]:
+    """Build one PostToolUse request. `original` is the result when it may be
+    rewritten: a whole, untruncated string."""
+    output_str = result if isinstance(result, str) else json.dumps(result, default=str)
+    # Ledger check: did pre_tool_call run for THIS call? If Hermes dispatched
+    # the tool without invoking it, the call ran with no policy check and the
+    # gateway must not record a clean pass.
+    if not _pop_pre(key):
+        _note_lapse(
+            tool_name,
+            "pre-hook-missing: Hermes did not invoke pre_tool_call for this call; "
+            "it ran without a policy check",
+        )
+
+    truncated = len(output_str.encode("utf-8")) > POST_HOOK_PAYLOAD_CEILING
+    if truncated:
+        output_str = output_str[:POST_HOOK_PAYLOAD_CEILING]
+
+    body: dict[str, Any] = {
+        "tool_name": tool_name,
+        "tool_input": args,
+        "tool_output": output_str,
+        "session_id": task_id,
+        "duration_ms": duration_ms,
+        "hook_event_name": "PostToolUse",
+        "agent_tier": "interactive",
+    }
+    if tool_call_id:
+        body["call_id"] = tool_call_id
+    lapses = _drain_lapses()
+    if lapses:
+        body["pre_lapse"] = lapses
+    return {
+        "body": body,
+        "lapses": lapses,
+        "token": token,
+        "tool": tool_name,
+        "original": result if isinstance(result, str) and not truncated else None,
+    }
+
+
+def _note_handled(key: str, by: str) -> None:
+    """Record that `by` ("transform" or "post") already sent this call's
+    PostToolUse, so the other hook for the same call does not send again."""
+    with _ledger_lock:
+        _handled_posts[key] = by
+        _handled_posts.move_to_end(key)
+        while len(_handled_posts) > HANDLED_POSTS_MAX:
+            _handled_posts.popitem(last=False)
+
+
+def _take_handled(key: str, by: str) -> bool:
+    with _ledger_lock:
+        if _handled_posts.get(key) != by:
+            return False
+        del _handled_posts[key]
+        return True
+
+
 def _post_tool_call(
     tool_name: str,
     args: dict[str, Any],
@@ -439,43 +514,23 @@ def _post_tool_call(
     if not token:
         return
 
-    # Ledger check: did pre_tool_call run for THIS call? If Hermes dispatched
-    # the tool without invoking it, the call ran with no policy check and the
-    # gateway must not record a clean pass.
     key = _call_key(tool_name, args, tool_call_id)
-    if not _pop_pre(key):
-        _note_lapse(
-            tool_name,
-            "pre-hook-missing: Hermes did not invoke pre_tool_call for this call; "
-            "it ran without a policy check",
-        )
+    if _take_handled(key, "transform"):
+        # Transform-first order: transform_tool_result already sent this
+        # call's PostToolUse, so the gateway sees it once.
+        return
 
-    truncated = len(output_str.encode("utf-8")) > POST_HOOK_PAYLOAD_CEILING
-    if truncated:
-        output_str = output_str[:POST_HOOK_PAYLOAD_CEILING]
-
-    body: dict[str, Any] = {
-        "tool_name": tool_name,
-        "tool_input": args,
-        "tool_output": output_str,
-        "session_id": task_id,
-        "duration_ms": duration_ms,
-        "hook_event_name": "PostToolUse",
-        "agent_tier": "interactive",
-    }
-    if tool_call_id:
-        body["call_id"] = tool_call_id
-    lapses = _drain_lapses()
-    if lapses:
-        body["pre_lapse"] = lapses
-    entry: dict[str, Any] = {"body": body, "lapses": lapses, "token": token, "tool": tool_name}
+    entry = _build_entry(key, tool_name, args, result, task_id, duration_ms, tool_call_id, token)
     if _transform_registered and _transform_follows(status, error_type):
-        # transform_tool_result sends this one, so the gateway sees the call
-        # once. Only a whole, untruncated string result may be rewritten.
+        # Post-first order: transform_tool_result sends this one, so the
+        # gateway sees the call once.
         entry["thread"] = threading.get_ident()
-        entry["original"] = result if isinstance(result, str) and not truncated else None
         _park_post(key, entry)
         return
+    if _transform_registered and tool_call_id:
+        # Sent now; a transform that still arrives for this call must not
+        # send it a second time.
+        _note_handled(key, "post")
     _flush_post(entry)
 
 
@@ -520,9 +575,14 @@ def _flush_post(entry: dict[str, Any], timeout: float | None = None) -> None:
 
 
 def _park_post(key: str, entry: dict[str, Any]) -> None:
-    """Hold a PostToolUse for transform_tool_result. Hermes runs the two hooks
-    back to back on one thread, so anything still parked from this thread
-    was never claimed: send it now rather than lose the audit row."""
+    """Hold a PostToolUse for transform_tool_result (post-first order).
+
+    Hermes runs the two hooks for one call back to back on one thread, in
+    either order: post then transform on the concurrent path, transform then
+    post on the sequential registry path. In the transform-first order the
+    transform has already sent the request and post_tool_call never parks.
+    So anything still parked from this thread when a new post arrives was
+    never claimed: send it now rather than lose the audit row."""
     stale: list[dict[str, Any]] = []
     with _ledger_lock:
         old = _pending_posts.pop(key, None)
@@ -538,9 +598,9 @@ def _park_post(key: str, entry: dict[str, Any]) -> None:
 
 
 def _flush_pending_posts(budget: float | None = None) -> None:
-    """Send what is still parked at exit, within one overall time budget so a
-    down gateway cannot hold up exit. Whatever does not fit is dropped with
-    one warning."""
+    """Send what is still parked at exit within an overall budget of about
+    EXIT_FLUSH_BUDGET_SECONDS, so a down gateway cannot hold up exit for
+    long. Whatever does not fit is dropped with one warning."""
     with _ledger_lock:
         stale = list(_pending_posts.values())
         _pending_posts.clear()
@@ -616,12 +676,28 @@ def _rewrite_applied(posted: dict[str, Any]) -> bool:
     return isinstance(pii, dict) and pii.get("applied") is True
 
 
-def _transform(tool_name: str, args: Any, result: Any, tool_call_id: str) -> str | None:
+def _transform(
+    tool_name: str,
+    args: Any,
+    result: Any,
+    tool_call_id: str,
+    task_id: str = "",
+    duration_ms: Any = 0,
+) -> str | None:
     key = _call_key(tool_name, args, tool_call_id)
     with _ledger_lock:
         entry = _pending_posts.pop(key, None)
+    if entry is None and _take_handled(key, "post"):
+        return None  # post_tool_call already sent this call (no rewrite asked).
     if entry is None:
-        return None  # Not logged in, or post_tool_call never ran: nothing to do.
+        # Transform-first order (Hermes's sequential registry path runs this
+        # hook before post_tool_call): build and send the request here, and
+        # mark the key so the post_tool_call that follows does not send again.
+        token = _resolve_token()
+        if not token:
+            return None  # Not logged in: nothing to do.
+        entry = _build_entry(key, tool_name, args, result, task_id, duration_ms, tool_call_id, token)
+        _note_handled(key, "transform")
     original = entry.get("original")
     # Rewrite only what the gateway saw, whole: the same string Hermes is
     # about to append to the conversation.
@@ -647,13 +723,15 @@ def _transform_tool_result(
     args: Any = None,
     result: Any = None,
     tool_call_id: str = "",
+    task_id: str = "",
+    duration_ms: Any = 0,
     **_: Any,
 ) -> str | None:
     """Return the gateway's rewritten result, or None to keep the original.
     Runs on the conversation path: never raises, never waits past the
     request timeout."""
     try:
-        return _transform(tool_name, args, result, tool_call_id)
+        return _transform(tool_name, args, result, tool_call_id, task_id, duration_ms)
     except Exception:
         return None
 
