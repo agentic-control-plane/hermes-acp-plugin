@@ -376,10 +376,11 @@ def test_unknown_approvals_mode_never_claims_a_person(hermes, mode):
 # --- unattended turns (`hermes -z`) approve like yolo ---------------------------
 
 
-def _session_finite(monkeypatch, unattended_turn) -> None:
+def _session_finite(monkeypatch, unattended_turn=lambda: False, finite_turn_required=lambda: None) -> None:
     gateway = types.ModuleType("gateway")
     session_finite = types.ModuleType("gateway.session_finite")
     session_finite.unattended_turn = unattended_turn
+    session_finite.finite_turn_required = finite_turn_required
     monkeypatch.setitem(sys.modules, "gateway", gateway)
     monkeypatch.setitem(sys.modules, "gateway.session_finite", session_finite)
 
@@ -424,11 +425,59 @@ def test_session_finite_that_fails_to_import_never_claims_a_person(monkeypatch):
     _assert_no_person(_pre_body(), "unknown")
 
 
+# --- finite turns (single-query) never ask -----------------------------------------
+
+
+def test_finite_turn_is_single_query_and_blocks_an_ask(monkeypatch):
+    _session_finite(monkeypatch, finite_turn_required=lambda: True)
+    result, (body,) = _run({"decision": "ask", "reason": ASK_REASON})
+    _assert_no_person(body, "single-query")
+    assert "capabilities" not in body
+    _assert_blocked(result, "this is a single-query run")
+
+
+@pytest.mark.parametrize("value", [None, False], ids=["no-marker", "not-finite"])
+def test_turn_that_is_not_finite_claims_a_person(monkeypatch, value):
+    _session_finite(monkeypatch, finite_turn_required=lambda: value)
+    assert _pre_body()["attended"] == {"claim": True, "source": "env", "mode": "cli"}
+
+
+@pytest.mark.parametrize("finite_turn_required", [_boom, lambda: "yes"], ids=["raises", "non-bool"])
+def test_unreadable_finite_turn_never_claims_a_person(monkeypatch, finite_turn_required):
+    _session_finite(monkeypatch, finite_turn_required=finite_turn_required)
+    result, (body,) = _run({"decision": "ask", "reason": ASK_REASON})
+    _assert_no_person(body, "unknown")
+    _assert_blocked(result)
+
+
+def test_missing_session_finite_module_is_not_finite_and_claims_a_person(monkeypatch):
+    """The fixture leaves gateway unimportable: a Hermes without the module."""
+    monkeypatch.setitem(sys.modules, "gateway.session_finite", None)
+    assert plugin._finite_turn() is False
+    assert plugin._unattended_turn() is False
+    assert _pre_body()["attended"]["claim"] is True
+
+
+# --- the source carries no raw bidi or format characters ------------------------
+
+
+def test_plugin_source_has_no_raw_bidi_or_format_characters():
+    source = Path(plugin.__file__).read_text(encoding="utf-8")
+    # Built with chr() so this file carries no raw bidi characters either.
+    hidden = [0x061C, *range(0x200B, 0x2010), *range(0x202A, 0x202F), *range(0x2066, 0x206A), 0xFEFF]
+    for path in (Path(plugin.__file__), Path(__file__)):
+        text = path.read_text(encoding="utf-8")
+        found = sorted({hex(c) for c in hidden if chr(c) in text})
+        assert not found, f"{path.name} has raw {found}"
+    # The pattern still removes them from a reason.
+    assert plugin._safe_reason("a" + chr(0x202E) + "b" + chr(0x2066) + "c" + chr(0x061C) + "d" + chr(0x200F) + "e") == "abcde"
+
+
 # --- the reason shown in the prompt carries no terminal control characters ------
 
 
 def test_control_characters_are_removed_from_the_prompt():
-    reason = ASK_REASON.replace("deploy prod", "deploy\x1b\r prod\x07‮")
+    reason = ASK_REASON.replace("deploy prod", "deploy\x1b\r prod\x07" + chr(0x202E))
     result, _ = _run({"decision": "ask", "reason": reason})
     assert result["action"] == "approve"
     assert result["message"] == ASK_REASON  # the three lines stay three lines

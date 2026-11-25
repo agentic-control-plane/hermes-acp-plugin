@@ -390,9 +390,10 @@ _PERSON_APPROVAL_MODES = frozenset({"manual", "smart"})
 # Characters dropped from a gateway reason before Hermes shows it: control
 # characters (terminal escapes, carriage returns) other than newline and tab,
 # and bidirectional overrides that can reorder what the person reads.
-_UNSAFE_REASON_CHARS = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩]"
+_BIDI_CONTROLS = "".join(
+    chr(c) for c in (0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A))
 )
+_UNSAFE_REASON_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f" + _BIDI_CONTROLS + "]")
 # Env vars that mean no person is at a terminal, with the mode each reports.
 _NO_PERSON_ENV = (
     ("HERMES_CRON_SESSION", "cron"),
@@ -469,6 +470,25 @@ def _unattended_turn() -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _finite_turn() -> bool | None:
+    """True for a turn Hermes runs as single-query (nobody to answer a
+    prompt); None when it cannot be read. Hermes returns None for a turn with
+    no marker, and a Hermes without the module has no such turn."""
+    try:
+        module = importlib.import_module("gateway.session_finite")
+    except ModuleNotFoundError:
+        return False
+    except Exception:
+        return None
+    try:
+        value = module.finite_turn_required()
+    except Exception:
+        return None
+    if value is None:
+        return False
+    return value if isinstance(value, bool) else None
+
+
 def _approval_mode() -> str | None:
     """Hermes's approvals.mode, or None when it cannot be read. Only a
     non-empty string counts as read; None or False is never "approvals on"."""
@@ -500,15 +520,22 @@ def _has_tty() -> bool:
 def _read_attended() -> dict[str, Any]:
     session_yolo = _session_yolo()
     unattended = _unattended_turn()
+    finite = _finite_turn()
     approval_mode = _approval_mode()
     if _yolo_env() or session_yolo is True or unattended is True:
         return {"claim": False, "source": "env", "mode": "yolo", "auto_approve": True}
     if approval_mode == "off":
         return {"claim": False, "source": "env", "mode": "approvals-off", "auto_approve": True}
-    if session_yolo is None or unattended is None or approval_mode not in _PERSON_APPROVAL_MODES:
-        # Unreadable, or a mode where something other than a person may
-        # answer (smart, or one the plugin does not know): never claim.
+    if (
+        session_yolo is None
+        or unattended is None
+        or finite is None
+        or approval_mode not in _PERSON_APPROVAL_MODES
+    ):
+        # Unreadable, or a mode the plugin does not know: never claim.
         return {"claim": False, "source": "env", "mode": "unknown"}
+    if finite is True:
+        return {"claim": False, "source": "env", "mode": "single-query"}
     for name, env_mode in _NO_PERSON_ENV:
         if _env_set(name):
             return {"claim": False, "source": "env", "mode": env_mode}
