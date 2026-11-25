@@ -5,9 +5,14 @@ Two independent planes, one plugin:
 Cloud governance (needs `hermes-acp login`):
   - POST /govern/tool-use   — pre-call policy check, can deny / ask / allow
   - POST /govern/tool-output — post-call observation, fire-and-forget
-  - An ACP `ask` decision escalates to Hermes's NATIVE approval gate
+  - Every PreToolUse says whether a person can answer a prompt here
+    (`attended`), and declares `capabilities: ["native_ask"]` only when one
+    can. An ACP `ask` then escalates to Hermes's NATIVE approval gate
     ({"action": "approve"}): the user answers [o]nce/[s]ession/[a]lways/[d]eny
-    inline, same as Hermes's own dangerous-shell tier.
+    inline, same as Hermes's own dangerous-shell tier. When nobody can be
+    asked (--yolo, /yolo, approvals off, cron, -q, a messaging gateway, no
+    terminal, or a state the plugin cannot read) the ask is blocked instead,
+    because Hermes would run an approved call unasked in those modes.
 
 Local metering (works with ZERO credentials, nothing leaves the machine):
   - post_api_request → model calls (tokens, cache buckets, cost via Hermes's
@@ -48,6 +53,7 @@ from __future__ import annotations
 import atexit
 import datetime as _dt
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -56,6 +62,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -66,7 +73,7 @@ from . import local_store, pricing
 # Only used when the package is imported from a source tree without dist
 # metadata (tests, `python -m` from a checkout). tests/test_cli.py pins it
 # to pyproject's version so a release bump can't leave it behind again.
-_FALLBACK_VERSION = "0.4.0"
+_FALLBACK_VERSION = "0.5.0"
 
 
 def _dist_version() -> str:
@@ -361,6 +368,228 @@ def _block(message: str) -> dict[str, str]:
     return {"action": "block", "message": message}
 
 
+# --- Attended claim -----------------------------------------------------------
+# Hermes's approval gate approves without asking under --yolo, a session
+# /yolo, or approvals.mode "off", and fails closed (or auto-approves, by
+# config) where no person is present. So an `approve` returned from
+# pre_tool_call only means "a person decides" when all of these hold; the
+# plugin tells the gateway which case it is in and blocks an ask otherwise.
+
+NATIVE_ASK_CAPABILITY = "native_ask"
+ASK_REASON_PREFIX = "ACP (Agentic Control Plane) asks: "
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+# Hermes reads HERMES_YOLO_MODE as on for 1/true/yes/on. The plugin reads it
+# as on for every value except an explicit off, so a value Hermes and the
+# plugin might read differently never claims a person.
+_NOT_YOLO = frozenset({"", "0", "false", "no", "off"})
+# approvals.mode values where Hermes puts a plugin ask in front of a person.
+# "off" approves unasked. "smart" only lets a model answer dangerous shell
+# commands; a plugin ask still goes to the person, so it counts. Any mode not
+# listed here, including one a later Hermes adds, never claims a person.
+_PERSON_APPROVAL_MODES = frozenset({"manual", "smart"})
+# Characters dropped from a gateway reason before Hermes shows it: control
+# characters (terminal escapes, carriage returns) other than newline and tab,
+# and bidirectional overrides that can reorder what the person reads.
+_BIDI_CONTROLS = "".join(
+    chr(c) for c in (0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A))
+)
+_UNSAFE_REASON_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f" + _BIDI_CONTROLS + "]")
+# Env vars that mean no person is at a terminal, with the mode each reports.
+_NO_PERSON_ENV = (
+    ("HERMES_CRON_SESSION", "cron"),
+    ("HERMES_SINGLE_QUERY_SESSION", "single-query"),
+    ("HERMES_GATEWAY_SESSION", "gateway"),
+    ("HERMES_SESSION_PLATFORM", "gateway"),
+    ("CI", "ci"),
+)
+_NOBODY_WHY = {
+    "yolo": "--yolo skips approval prompts",
+    "approvals-off": "approvals are switched off",
+    "cron": "this is a cron run",
+    "single-query": "this is a single-query run",
+    "gateway": "this session runs through a messaging gateway",
+    "ci": "this is a CI run",
+    "no-tty": "there is no terminal",
+    "not-interactive": "this is not an interactive Hermes session",
+    "unknown": "the plugin cannot confirm that Hermes would ask a person",
+}
+
+
+def _session_env(name: str) -> str:
+    """Session-scoped env value from Hermes when it can be read, else the
+    process env."""
+    try:
+        get_session_env = importlib.import_module("gateway.session_context").get_session_env
+    except Exception:
+        return os.environ.get(name, "")
+    try:
+        value = get_session_env(name)
+    except Exception:
+        return os.environ.get(name, "")
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
+def _env_set(name: str) -> bool:
+    return bool(os.environ.get(name, "").strip() or _session_env(name).strip())
+
+
+def _yolo_env() -> bool:
+    """`--yolo` sets HERMES_YOLO_MODE. Any value other than an explicit off
+    counts, because Hermes treats it as on."""
+    return any(
+        v.strip().lower() not in _NOT_YOLO
+        for v in (os.environ.get("HERMES_YOLO_MODE", ""), _session_env("HERMES_YOLO_MODE"))
+    )
+
+
+def _session_yolo() -> bool | None:
+    """True or False from Hermes's /yolo toggle; None when it cannot be read."""
+    try:
+        value = importlib.import_module("tools.approval").is_current_session_yolo_enabled()
+    except Exception:
+        return None
+    return value if isinstance(value, bool) else None
+
+
+def _unattended_turn() -> bool | None:
+    """True for a turn Hermes runs with nobody to answer (`hermes -z`), which
+    its gate approves like yolo; None when it cannot be read. A Hermes without
+    the module has no such turn."""
+    try:
+        module = importlib.import_module("gateway.session_finite")
+    except ModuleNotFoundError:
+        return False
+    except Exception:
+        return None
+    try:
+        value = module.unattended_turn()
+    except Exception:
+        return None
+    return value if isinstance(value, bool) else None
+
+
+def _finite_turn() -> bool | None:
+    """True for a turn Hermes runs as single-query (nobody to answer a
+    prompt); None when it cannot be read. Hermes returns None for a turn with
+    no marker, and a Hermes without the module has no such turn."""
+    try:
+        module = importlib.import_module("gateway.session_finite")
+    except ModuleNotFoundError:
+        return False
+    except Exception:
+        return None
+    try:
+        value = module.finite_turn_required()
+    except Exception:
+        return None
+    if value is None:
+        return False
+    return value if isinstance(value, bool) else None
+
+
+def _approval_mode() -> str | None:
+    """Hermes's approvals.mode, or None when it cannot be read. Only a
+    non-empty string counts as read; None or False is never "approvals on"."""
+    for module_name in ("tools.approval_context", "tools.approval"):
+        try:
+            module = importlib.import_module(module_name)
+            getter = getattr(module, "_get_approval_mode", None)
+        except Exception:
+            continue
+        if not callable(getter):
+            continue
+        try:
+            value = getter()
+        except Exception:
+            return None
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+        return None
+    return None
+
+
+def _has_tty() -> bool:
+    try:
+        return bool(sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _read_attended() -> dict[str, Any]:
+    session_yolo = _session_yolo()
+    unattended = _unattended_turn()
+    finite = _finite_turn()
+    approval_mode = _approval_mode()
+    if _yolo_env() or session_yolo is True or unattended is True:
+        return {"claim": False, "source": "env", "mode": "yolo", "auto_approve": True}
+    if approval_mode == "off":
+        return {"claim": False, "source": "env", "mode": "approvals-off", "auto_approve": True}
+    if (
+        session_yolo is None
+        or unattended is None
+        or finite is None
+        or approval_mode not in _PERSON_APPROVAL_MODES
+    ):
+        # Unreadable, or a mode the plugin does not know: never claim.
+        return {"claim": False, "source": "env", "mode": "unknown"}
+    if finite is True:
+        return {"claim": False, "source": "env", "mode": "single-query"}
+    for name, env_mode in _NO_PERSON_ENV:
+        if _env_set(name):
+            return {"claim": False, "source": "env", "mode": env_mode}
+    if not _has_tty():
+        return {"claim": False, "source": "env", "mode": "no-tty"}
+    if _session_env("HERMES_INTERACTIVE").strip().lower() not in _TRUTHY:
+        return {"claim": False, "source": "env", "mode": "not-interactive"}
+    return {"claim": True, "source": "env", "mode": "cli"}
+
+
+def _attended() -> dict[str, Any]:
+    """Whether a person can answer Hermes's approval prompt right now."""
+    try:
+        return _read_attended()
+    except Exception:
+        return {"claim": False, "source": "env", "mode": "unknown"}
+
+
+def _rule_key(tool_name: str, verdict: dict[str, Any], tool_call_id: str) -> str:
+    """Unique per ask. Hermes stores a [s]ession or [a]lways answer under this
+    key and approves later asks with the same key unasked, so a shared key
+    would let one answer silence every later gateway ask. The id is only a
+    readable prefix; the fresh uuid makes every key new."""
+    ref = next(
+        (v for v in (verdict.get("approval_id"), tool_call_id) if isinstance(v, str) and v),
+        "",
+    )
+    ref = re.sub(r"[^A-Za-z0-9._-]", "_", ref)[:64]
+    fresh = uuid.uuid4().hex
+    return f"acp:{tool_name}:{ref}:{fresh}" if ref else f"acp:{tool_name}:{fresh}"
+
+
+def _safe_reason(reason: Any) -> str:
+    """The gateway reason as text with terminal control characters removed.
+    Nothing else changes: no cutting, wrapping or escaping."""
+    return _UNSAFE_REASON_CHARS.sub("", reason if isinstance(reason, str) else str(reason))
+
+
+def _ask_message(reason: Any) -> str:
+    reason = _safe_reason(reason)
+    if reason.startswith(ASK_REASON_PREFIX) or reason.startswith("[ACP]"):
+        return reason
+    return f"[ACP] Approval required: {reason}"
+
+
+def _nobody_to_ask(mode: Any, reason: Any) -> str:
+    reason = _safe_reason(reason)
+    why = _NOBODY_WHY.get(mode, _NOBODY_WHY["unknown"])
+    return (
+        f"[ACP] This call needs a person's approval. Hermes cannot ask here ({why}), "
+        f"so it is blocked. Approve it in the ACP console, then run it again.\n\n{reason}"
+    )
+
+
 def _pre_tool_call(
     tool_name: str,
     args: dict[str, Any],
@@ -384,6 +613,10 @@ def _pre_tool_call(
     }
     if tool_call_id:
         body["call_id"] = tool_call_id
+    attended = _attended()
+    body["attended"] = attended
+    if attended["claim"] is True:
+        body["capabilities"] = [NATIVE_ASK_CAPABILITY]
     result, failure, status, code = _post_json_full("/govern/tool-use", body, token)
     if result is None and status in (401, 403):
         _key_rejected(tool_name, status, code, task_id)
@@ -393,19 +626,27 @@ def _pre_tool_call(
         # verdict, so the next PostToolUse tells the gateway.
         _note_lapse(tool_name, f"gateway unreachable at PreToolUse: {failure or 'unknown'}")
         return None
+    if not isinstance(result, dict):
+        # Parsed but not an object: same as unparseable, never an approve.
+        _note_lapse(tool_name, "gateway unreachable at PreToolUse: unparseable gateway response")
+        return None
 
     decision = result.get("decision")
     reason = result.get("reason") or "policy did not return a reason"
     if decision == "deny":
         return _block(f"[ACP] Denied by policy: {reason}")
     if decision == "ask":
+        # Check again now: a /yolo typed while the request was out counts.
+        now = _attended()
+        if now["claim"] is not True:
+            # Hermes would approve unasked or nobody is there: never approve.
+            return _block(_nobody_to_ask(now.get("mode"), reason))
         # Escalate to Hermes's native human-approval gate — the same
         # once/session/always/deny prompt its dangerous-shell tier uses.
-        # rule_key scopes an [a]lways answer to this tool under ACP's grain.
         return {
             "action": "approve",
-            "message": f"[ACP] Approval required: {reason}",
-            "rule_key": f"acp:{tool_name}",
+            "message": _ask_message(reason),
+            "rule_key": _rule_key(tool_name, result, tool_call_id),
         }
     return None
 
