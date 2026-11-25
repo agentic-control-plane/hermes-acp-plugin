@@ -80,10 +80,26 @@ def test_pre_deny_returns_block(tmp_path):
     assert "[ACP]" in result["message"]
 
 
-def test_pre_ask_escalates_to_native_approval_gate(tmp_path):
+def _attended_terminal(monkeypatch) -> None:
+    """A person at an interactive Hermes terminal, no auto-approve mode."""
+    import acp_hermes
+
+    for name in ("HERMES_YOLO_MODE", "HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION",
+                 "HERMES_GATEWAY_SESSION", "HERMES_SESSION_PLATFORM", "CI"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    monkeypatch.setattr(acp_hermes, "_session_yolo", lambda: False)
+    monkeypatch.setattr(acp_hermes, "_approval_mode", lambda: "manual")
+    monkeypatch.setattr(acp_hermes, "_unattended_turn", lambda: False)
+    monkeypatch.setattr(acp_hermes, "_has_tty", lambda: True)
+
+
+def test_pre_ask_escalates_to_native_approval_gate(tmp_path, monkeypatch):
     """ACP `ask` returns Hermes's approve directive — the native
-    once/session/always/deny prompt — not a hard block (0.1.1)."""
+    once/session/always/deny prompt — not a hard block (0.1.1), when a
+    person is at the terminal to answer it."""
     _write_token(tmp_path)
+    _attended_terminal(monkeypatch)
     with patch(
         "urllib.request.urlopen",
         _fake_urlopen({"decision": "ask", "reason": "needs review"}),
@@ -92,7 +108,9 @@ def test_pre_ask_escalates_to_native_approval_gate(tmp_path):
     assert result is not None
     assert result["action"] == "approve"
     assert "needs review" in result["message"]
-    assert result["rule_key"] == "acp:terminal"
+    # Unique per ask, so a remembered answer never matches a later ask.
+    assert result["rule_key"].startswith("acp:terminal:")
+    assert result["rule_key"] != "acp:terminal"
 
 
 def test_pre_network_error_fails_open(tmp_path):

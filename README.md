@@ -107,7 +107,7 @@ The plugin registers five Hermes hooks:
 
 | Hook               | Plane | Behavior                                                   |
 |--------------------|-------|------------------------------------------------------------|
-| `pre_tool_call`    | cloud | POSTs to `/govern/tool-use`. Server returns `allow` / `deny` / `ask`. `deny` blocks with a system message; `ask` escalates to Hermes's native approval prompt; `allow` passes through. |
+| `pre_tool_call`    | cloud | POSTs to `/govern/tool-use`. Server returns `allow` / `deny` / `ask`. `deny` blocks with a system message; `ask` escalates to Hermes's native approval prompt when a person can answer it, and blocks otherwise (see below); `allow` passes through. |
 | `post_tool_call`   | both  | Records duration, status, and result size locally; POSTs to `/govern/tool-output` for server-side audit, redaction logging, and DLP scanning when logged in. When `transform_tool_result` is registered, whichever of the two hooks Hermes runs first for a call sends it, so each call reaches the gateway once. |
 | `transform_tool_result` | cloud | Sends the `/govern/tool-output` request (held by `post_tool_call` if that ran first, otherwise built here) and, if the gateway removed personal data, hands Hermes the rewritten result before the model sees it. Hermes runs it after `post_tool_call` on its concurrent path and before it on its sequential registry path; both orders are handled. |
 | `post_api_request` | local | Records each LLM API request (model, token buckets: input / output / cache read / cache write / reasoning, and latency) and prices it with Hermes's own pricing engine. |
@@ -131,11 +131,23 @@ A line on stderr says what happened. It says "removed" only when the plugin actu
 
 ### Fail-open
 
-Network errors, timeouts (>4s), malformed responses, a full disk, or a locked SQLite file all **fail open**: the tool call proceeds and (for network issues) a warning is written to stderr. Hermes has no unattended tier in this plugin, so this holds for every session, background runs included. A call that ran without a policy check is recorded as a lapse and shows as "ran ungoverned" in the console.
+Network errors, timeouts (>4s), malformed responses, a full disk, or a locked SQLite file all **fail open**: the tool call proceeds and (for network issues) a warning is written to stderr. An unreachable gateway never produces an approval prompt. Hermes has no unattended tier in this plugin, so this holds for every session, background runs included. A call that ran without a policy check is recorded as a lapse and shows as "ran ungoverned" in the console.
 
 ### "Ask" semantic
 
-Today the gateway does not send asks to Hermes, so a hold is blocked with a system message: approve it on the console or from the email, then retry. The plugin can render an ACP `ask` through **Hermes's native approval gate** once the gateway sends asks to Hermes, the same inline `[o]nce / [s]ession / [a]lways / [d]eny` prompt Hermes uses for dangerous shell commands. An `[a]lways` answer is scoped to the tool via the plugin's `rule_key` (`acp:<tool>`), so a standing approval never widens beyond the tool the human actually reviewed. (Versions ≤0.1.0 wrongly claimed Hermes had no approval surface and hard-blocked with a dashboard detour. Upgrade.)
+When the gateway holds a call for approval, the plugin shows it through **Hermes's native approval gate**, the same inline `[o]nce / [s]ession / [a]lways / [d]eny` prompt Hermes uses for dangerous shell commands. Hermes labels that prompt "DANGEROUS COMMAND"; the lines under it are the gateway's reason.
+
+The prompt appears only when a person is there to answer it: Hermes runs interactively (`HERMES_INTERACTIVE`) in a terminal (stdin and stdout are both a TTY), the session is not a cron run, a single-query run (`-q`), a messaging-gateway session or a CI job, and no auto-approve mode is on. Each PreToolUse tells the gateway which case applies (`attended: {claim, source: "env", mode}`) and declares `capabilities: ["native_ask"]` only when the prompt can be shown.
+
+In every other case a held call is blocked, with a message that says why Hermes cannot ask and the gateway's reason. Approve it in the ACP console, then run it again. This includes `--yolo` and `/yolo`: Hermes approves every prompt unasked in yolo mode, so the plugin turns a held call into a block instead of letting it run. Approvals switched off (`approvals.mode: off`) and unattended runs (`hermes -z`) are treated the same way. The prompt is shown only with `approvals.mode: manual` (Hermes's default): under `smart`, or any mode the plugin does not know, a held call is blocked. If the plugin cannot read Hermes's yolo or approvals setting, it does not claim a person is there and blocks the held call.
+
+Control characters and bidirectional-override characters in the gateway's reason are removed before Hermes shows it; the text is otherwise unchanged.
+
+If `/yolo` is typed in the moment between the plugin's last check and Hermes's own gate, Hermes approves that call unasked. The plugin checks again right before handing the ask to Hermes, which leaves only that moment.
+
+An `[s]ession` or `[a]lways` answer applies only to the call you were asked about. It does not carry over to later asks, even for the same tool and command: each ask has its own `rule_key`, so the next held call prompts again. Each "always" answer leaves one unused entry in Hermes's `command_allowlist`; it is harmless and can be deleted.
+
+(Versions ≤0.1.0 wrongly claimed Hermes had no approval surface and hard-blocked with a dashboard detour. Upgrade.)
 
 ### Client identity
 
