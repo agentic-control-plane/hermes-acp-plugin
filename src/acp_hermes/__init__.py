@@ -383,9 +383,10 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 # plugin might read differently never claims a person.
 _NOT_YOLO = frozenset({"", "0", "false", "no", "off"})
 # approvals.mode values where Hermes puts a plugin ask in front of a person.
-# "off" approves unasked; "smart" lets a model answer some prompts. Any mode
-# not listed here, including one a later Hermes adds, never claims a person.
-_PERSON_APPROVAL_MODES = frozenset({"manual"})
+# "off" approves unasked. "smart" only lets a model answer dangerous shell
+# commands; a plugin ask still goes to the person, so it counts. Any mode not
+# listed here, including one a later Hermes adds, never claims a person.
+_PERSON_APPROVAL_MODES = frozenset({"manual", "smart"})
 # Characters dropped from a gateway reason before Hermes shows it: control
 # characters (terminal escapes, carriage returns) other than newline and tab,
 # and bidirectional overrides that can reorder what the person reads.

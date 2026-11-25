@@ -352,16 +352,20 @@ def test_unreadable_hermes_state_never_claims_a_person(hermes, monkeypatch, setu
 # --- approvals modes: only one that puts the prompt in front of a person claims -
 
 
-@pytest.mark.parametrize("mode", ["manual", "MANUAL", " Manual "])
-def test_manual_approvals_mode_claims_a_person(hermes, mode):
+@pytest.mark.parametrize("mode", ["manual", "MANUAL", " Manual ", "smart", "SMART"])
+def test_manual_or_smart_approvals_mode_claims_a_person(hermes, mode):
+    """Smart mode only lets a model answer dangerous shell commands; a plugin
+    ask still goes to the person."""
     hermes.mode = mode
     assert _pre_body()["attended"] == {"claim": True, "source": "env", "mode": "cli"}
+    result, _ = _run({"decision": "ask", "reason": ASK_REASON})
+    assert result["action"] == "approve"
 
 
-@pytest.mark.parametrize("mode", ["smart", "SMART", "auto", "guardian", "on", "ask"])
-def test_smart_or_unknown_approvals_mode_never_claims_a_person(hermes, mode):
-    """In smart mode a model may answer Hermes's prompt; a mode the plugin
-    does not know might do the same. Neither claims a person."""
+@pytest.mark.parametrize("mode", ["auto", "guardian", "on", "ask"])
+def test_unknown_approvals_mode_never_claims_a_person(hermes, mode):
+    """A mode the plugin does not know might let something other than a
+    person answer, so it never claims one."""
     hermes.mode = mode
     result, (body,) = _run({"decision": "ask", "reason": ASK_REASON})
     _assert_no_person(body, "unknown")
